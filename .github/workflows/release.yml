@@ -1,0 +1,124 @@
+name: Build release artifacts
+
+# 事件驱动：推一个 v* 标签就自动打包并挂到 GitHub Release。
+#
+# 为什么是"标签触发"而不是"push main 就发"：
+#   打 Release 是有外部影响的操作（别人会下载安装），应该是显式决定。
+#   平时 push main 只跑验证，不产出 Release。
+#
+# 发版流程：
+#   1. 改 plugin/package.json 的 version
+#   2. node scripts/verify-all.mjs          （本地先确认全绿）
+#   3. git tag v0.2.0 && git push origin v0.2.0
+#   4. 本 workflow 自动构建、验证、创建 Release 并附上 zip / tgz
+#
+# 关于 npm 发布：
+#   本 workflow **不**自动发 npm。发 npm 需要账号凭据，应当是显式动作，
+#   见 docs/DISTRIBUTION.md。要启用请另加 job 并配置 NPM_TOKEN。
+
+on:
+  push:
+    tags:
+      - 'v*'
+  # 手动触发：用来先干跑一遍看产物对不对，不会创建 Release
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22.x'
+
+      - name: Setup pnpm
+        # `dsh plugin` 是 pnpm 的前向器，pack.ps1 也用 pnpm pack 产出 tarball
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - name: Show tool versions
+        shell: pwsh
+        run: |
+          node --version
+          pnpm --version
+          $PSVersionTable.PSVersion
+
+      # 先跑逻辑验证：打包前确认代码本身是好的
+      - name: Verify plugin logic
+        shell: pwsh
+        run: |
+          node scripts/verify-all.mjs
+          node scripts/verify-no-lamp-logic.mjs
+
+      - name: Build artifacts
+        shell: pwsh
+        run: ./scripts/pack.ps1
+
+      # 产物验证：确认 zip 里真的带了依赖树、install.ps1 是纯 ASCII、校验和正确
+      - name: Verify artifacts
+        shell: pwsh
+        run: node scripts/verify-dist.mjs
+
+      - name: Show artifact summary
+        shell: pwsh
+        run: |
+          Get-ChildItem dist | Select-Object Name, Length | Format-Table -AutoSize
+          Get-Content dist/SHA256SUMS.txt
+
+      # 无论是否发 Release，都把产物留成 workflow artifact，方便手动下载
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dsh-led-bridge-dist
+          path: |
+            dist/*.zip
+            dist/*.tgz
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $version = (Get-Content plugin/package.json -Raw | ConvertFrom-Json).version
+          $tag = "${{ github.ref_name }}"
+
+          # 标签和 package.json 的版本必须一致，否则下载到的东西和标签对不上
+          if ($tag -ne "v$version") {
+            Write-Error "Tag $tag does not match package.json version v$version"
+            exit 1
+          }
+
+          # 用数组拼多行说明：PowerShell here-string 的结束标记必须顶格，
+          # 在缩进的 YAML 块里很容易写错，数组拼接更稳。
+          $notes = @(
+            "dsh-led-bridge v$version",
+            "",
+            "See docs/DISTRIBUTION.md for the two install shapes.",
+            "",
+            "- dsh-led-bridge-$version.zip  -- self-contained, zero configuration.",
+            "  Extract and run install.ps1.",
+            "- dsh-led-bridge-$version.tgz  -- dependency-free npm tarball.",
+            "  Needs an allowBuilds entry; see the docs.",
+            "",
+            "Verify downloads against SHA256SUMS.txt."
+          ) -join "`n"
+
+          gh release create $tag `
+            --target "${{ github.sha }}" `
+            --title "dsh-led-bridge v$version" `
+            --notes $notes `
+            "dist/dsh-led-bridge-$version.zip" `
+            "dist/dsh-led-bridge-$version.tgz" `
+            "dist/SHA256SUMS.txt"

@@ -1,0 +1,42 @@
+{
+  "name": "dsh-led-bridge",
+  "version": "0.2.0",
+  "description": "Stream DeepSeek Harness (DSH) live work status to an ESP32-C3 traffic-light desk toy over USB serial. An experimental bridge; the full multi-output plugin is dsh-beacon.",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "esp32",
+    "esp32-c3",
+    "status-light",
+    "serial"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Rrttttttt/dsh-beacon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Rrttttttt/dsh-beacon/issues"
+  },
+  "homepage": "https://github.com/Rrttttttt/dsh-beacon#readme",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "dependencies": {
+    "serialport": "^13.0.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
