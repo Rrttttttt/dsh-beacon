@@ -207,6 +207,35 @@ if (existsSync(join(ROOT, 'scripts', '_zip.mjs')) && codeLines.some((l) => l.inc
   bad('没有看到 _zip.mjs 被调用 —— zip 的确定性无法保证')
 }
 
+// tarball 也必须自己写。`pnpm pack` 的字节受 gzip 头的 OS 字节、pnpm/npm 版本等
+// 环境影响：实测本地连续两次稳定，但 CI 打出的 tgz 与本机不同（20837 vs 20226 字节），
+// 而本机复现不出 CI 的字节 —— 复现不了就无法核对。
+if (codeLines.some((l) => /pnpm pack/.test(l))) {
+  bad('打包脚本仍在用 pnpm pack 产出 tgz（其字节受环境影响，实测 CI 与本机不同）')
+} else {
+  ok('打包脚本已不用 pnpm pack（tgz 改由 _targz.mjs 确定性写出）')
+}
+
+if (existsSync(join(ROOT, 'scripts', '_targz.mjs')) && codeLines.some((l) => l.includes('_targz.mjs'))) {
+  ok('tgz 由 scripts/_targz.mjs 产出')
+} else {
+  bad('没有看到 _targz.mjs 被调用 —— tgz 的确定性无法保证')
+}
+
+// 顺带确认 gzip 的 OS 字节被固定（不固定的话同一份内容在不同平台字节就不同）
+const targzSrc = readFileSync(join(ROOT, 'scripts', '_targz.mjs'), 'utf8')
+if (/gz\[9\]\s*=/.test(targzSrc) && /mtime:\s*0/.test(targzSrc)) {
+  ok('_targz.mjs 固定了 gzip 的 OS 字节与 mtime')
+} else {
+  bad('_targz.mjs 没有固定 gzip 的 OS 字节/mtime —— 跨平台字节会不同')
+}
+
+if (/FIXED_MTIME|499162500/.test(targzSrc)) {
+  ok('_targz.mjs 固定了 tar 条目的 mtime')
+} else {
+  bad('_targz.mjs 没有固定 tar 条目的 mtime')
+}
+
 console.log('')
 if (failures === 0) {
   console.log('结果：全部通过 ✅\n')

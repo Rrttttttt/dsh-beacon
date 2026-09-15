@@ -31,6 +31,7 @@ import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createHash } from 'node:crypto'
+import { gunzipSync } from 'node:zlib'
 import { listZip, listTarGz, readTarGzText } from './_archive.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -258,9 +259,42 @@ if (existsSync(TGZ)) {
     const unexpected = entries.filter((e) => !allowed.has(e))
     check('tgz 没有多余文件', unexpected.length === 0, unexpected.slice(0, 8).join(', '))
     check(
-      'tgz 不含 node_modules（pnpm pack 永远排除，故 tgz 装不了自带依赖）',
+      'tgz 不含 node_modules（没有自带依赖树，只能靠依赖声明去拉）',
       !entries.some((e) => e.includes('node_modules')),
     )
+
+    // ---- tgz 必须是 npm 能接受的 tar ----
+    //
+    // 这条守的是一个**只有 npm 会报**的 bug：我们自己写 tar（为了字节可复现），
+    // 曾经把 `ustar` magic 写到偏移 157（那是 linkname 字段）而不是 257。
+    // 后果：magic 全零 → npm 的解析器退回 GNU tar 语义 → 空 linkname 被判成
+    // "linkpath forbidden"，整个包 `TAR_BAD_ARCHIVE` 装不上。
+    // 而**系统 tar 与 Node 自己的解析器都不在意**，所以只有真跑 npm install 才会现形。
+    //
+    // 这里直接校验 tar 头规范要求的字段，比"跑一遍 npm install"快得多，
+    // 也正好覆盖那个失败模式。
+    try {
+      const head = gunzipSync(readFileSync(TGZ)).subarray(0, 512)
+      const magic = head.subarray(257, 263).toString('utf8')
+      check('tgz 第一个 tar 头的 magic 是 ustar（在偏移 257）', magic === 'ustar\0', JSON.stringify(magic))
+      const ver = head.subarray(263, 265).toString('utf8')
+      check('tgz tar 头的 version 是 00', ver === '00', JSON.stringify(ver))
+      // 校验和字段必须自洽（否则 npm 会报 TAR_ENTRY_INVALID checksum failure）
+      const tmp = Buffer.from(head)
+      const stored = tmp.subarray(148, 156).toString('utf8')
+      for (let i = 148; i < 156; i++) tmp[i] = 32
+      let sum = 0
+      for (let i = 0; i < 512; i++) sum += tmp[i]
+      check(
+        'tgz tar 头校验和自洽',
+        stored.startsWith(sum.toString(8).padStart(6, '0')),
+        `写入 ${JSON.stringify(stored)} 实测 ${sum.toString(8)}`,
+      )
+      const typeflag = head.subarray(156, 157).toString('utf8')
+      check('tgz 第一个条目是普通文件（typeflag 0）', typeflag === '0', JSON.stringify(typeflag))
+    } catch (e) {
+      bad('无法读取 tgz 的 tar 头', e.message)
+    }
 
     // ---- 关键断言：tarball 必须声明依赖 ----
     //

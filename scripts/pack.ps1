@@ -367,24 +367,25 @@ Copy-Item -LiteralPath (Join-Path $pluginSrc 'package.json') -Destination (Join-
 
 $tPkg = Get-Content -LiteralPath (Join-Path $tarballSrc 'package.json') -Raw | ConvertFrom-Json
 if (-not $tPkg.dependencies -or -not $tPkg.dependencies.serialport) {
-    throw 'The tarball staging manifest has no serialport dependency. A tarball without it cannot work (pnpm pack drops node_modules).'
+    throw 'The tarball staging manifest has no serialport dependency. A tarball without it cannot work.'
 }
 Write-Ok "tarball declares dependencies: $((@($tPkg.dependencies.PSObject.Properties.Name)) -join ', ')"
 
-Push-Location $tarballSrc
-try {
-    & pnpm pack --pack-destination $distRoot 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw "pnpm pack failed with exit code $LASTEXITCODE" }
-} finally {
-    Pop-Location
-}
+# Norm and then pack with scripts/_targz.mjs, NOT `pnpm pack`.
+#
+# Why: `pnpm pack`'s output bytes depend on things outside our control (the gzip
+# header's OS byte, pnpm/npm version, and more). Local runs were stable, but CI
+# produced a DIFFERENT tgz from the same commit (20837 vs 20226 bytes) -- and I
+# could not reproduce CI's bytes locally, which means the artifact could not be
+# verified by anyone. If it has to be reproducible, we pin every byte ourselves.
+& (Join-Path $PSScriptRoot 'write-json.ps1') -Path (Join-Path $tarballSrc 'package.json')
+if ($LASTEXITCODE -ne 0) { throw 'write-json.ps1 failed on the tarball manifest' }
 
 $producedTgz = Join-Path $distRoot $tgzName
-if (-not (Test-Path -LiteralPath $producedTgz)) {
-    $found = Get-ChildItem -LiteralPath $distRoot -Filter '*.tgz' -ErrorAction SilentlyContinue
-    if ($found) { $producedTgz = $found[0].FullName; $tgzName = $found[0].Name }
-    else { throw 'pnpm pack reported success but produced no .tgz' }
-}
+if (Test-Path -LiteralPath $producedTgz) { Remove-Item -LiteralPath $producedTgz -Force }
+& node (Join-Path $PSScriptRoot '_targz.mjs') $tarballSrc $producedTgz
+if ($LASTEXITCODE -ne 0) { throw "_targz.mjs failed with exit code $LASTEXITCODE" }
+if (-not (Test-Path -LiteralPath $producedTgz)) { throw "tarball was not produced at $producedTgz" }
 Write-Ok "tarball: $tgzName"
 
 # Staging is an implementation detail; keep dist/ clean.
