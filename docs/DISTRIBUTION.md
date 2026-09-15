@@ -199,6 +199,69 @@ npm publish --access public
 
 记在这里是为了**别重犯**，尤其是那些"表面成功、实际坏掉"的类型。
 
+### v0.2.6：notify 闪烁期间到达的状态会被**回滚**（固件 bug）
+
+**症状**：`goal/change` / `sandbox/mode` 触发绿灯快闪，若闪烁的 600ms 窗口内
+正好来了 `turn/end`，**闪烁结束后灯会退回旧状态**：
+
+```
+thinking ──notify──▶ 开始闪 ──turn/end──▶ 灯切绿(success) ──闪完──▶ 退回黄呼吸(thinking)
+```
+
+而插件那边的 `#base` 已经是 `success`，**去重逻辑让它不会再发一次**，
+于是灯会一直错到下一次真实状态变化。
+
+**根因**（代码级确认，不是猜测）：
+
+| 位置 | 行为 |
+|---|---|
+| `.ino` 串口解析循环 | **先**解析并执行命令 |
+| `.ino` notify 覆盖层 | **后**进闪烁分支 |
+| `.ino` 快照那一行 | `if (!notifyActive) savedState = currentState;` —— 只在**还没在闪**时拍 |
+| `.ino` 闪完分支 | `target = notifyAfter`；空则 `target = savedState` → `applyCommand(target)` |
+
+于是裸 `notify`（`notifyAfter` 为空）在闪完时回到 `savedState`，而那份快照是
+**闪烁前**的旧状态 —— 把窗口内刚应用的新状态覆盖掉了。
+
+窗口只有 600ms，但 `goal/change` 与 `sandbox/mode` 都会发裸 notify，
+在本机日志里 `sandbox/mode` 出现过 54 次，**可达**。
+
+**头部注释也是错的**：原文写「notify 闪烁期间，其他状态命令会被暂时忽略」。
+实际是**先应用再回滚**。三种可能里"忽略"无害、"应用"也无害，
+**只有"应用完再覆盖成旧的"会坏** —— 而代码恰好是这一种。
+
+**修法**：状态真的改变时**作废那份快照**（`savedState = ""`）。
+之后闪烁结束的兜底链 `notifyAfter → savedState → currentState` 自然落到**新状态**，
+即"最新命令赢"。只在**值真的变了**时才作废 —— 重复的同值命令不该改变
+"闪完回到闪烁前状态"这个语义。头部注释同步改成实际行为。
+
+**为什么这次两侧都要改**：
+
+- 固件：真正的 bug 在这里。改完需**重烧**才生效。
+- `simulate.mjs`：它也复现不出这个 bug，但原因**不同** ——
+  它压根没实现"只在没在闪时拍快照"，因为 `simulate()` 在每条命令后有一行
+  `board.savedState = board.currentState` 无条件覆盖，把快照时机彻底绕过了。
+  删掉那行、按固件补齐快照时机与"作废"逻辑后，模拟器才能反映真机。
+
+> **又一次印证**：模拟器是我理解的镜像，它同意我不等于真机同意我。
+> 这已是同一类问题第二次出现（上一次是 `updateToolsEffect` 的"撤销"语义）。
+
+**顺带修掉模拟器一个凭空造出的状态**：
+`firmwareNotifyFinished` 原先用 `board.notifyAfter || board.savedState || 'off'`
+**直接赋值** `currentState`。固件里那句 `if (target 为空) target = "off"` 看着像
+兜底成 off，其实无害 —— 快照为空只可能发生在"闪烁期间有新状态改变了 currentState"
+那条路径上，而那时 `currentState` 已经是新状态，`applyCommand` 到同一个值等于什么都不做。
+模拟器直接赋值则会**把 success 打成 off**，造出一个固件不会有的状态。
+现在改成"快照与 notifyAfter 都为空时保持 currentState 不动"。
+
+**防回归**：
+- `simulate.mjs` 新增「场景 11」两条测试（新增 `<<firmware-cmd>>` 指令，
+  用于精确控制"两条命令之间是否发生闪烁结束"）。
+  实测把修复回退后该测试**立刻变红**（29/30），恢复后 30/30 —— 它真的能抓住这个 bug。
+- `audit-boundaries.mjs` 加三条**结构断言**（固件跑在板子上，CI 里编译不了也跑不了，
+  行为断言只能靠模拟器）：固件含作废快照的修复、不再声称"命令会被忽略"、
+  闪完仍走 `applyCommand(target)`。
+
 ### v0.2.5：同一个坑犯了第二次 —— 而且守卫本身没人跑
 
 **症状**：`verify-reproducible.mjs`（v0.2.4 新增，用来守 N1 的）在禁止管道的环境里报

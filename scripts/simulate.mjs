@@ -203,6 +203,10 @@ function firmwareHandle(cmd, board, nowMs = board.nowMs || 0) {
 
   // 对应 .ino: if (cmd === "notify" || cmd.startsWith("notify "))
   if (line === 'notify' || line.startsWith('notify ')) {
+    // 对应 .ino: if (!notifyActive) savedState = currentState;
+    // ⚠️ "只在还没在闪的时候拍快照"是必须的 —— 否则连续两次 notify 会让快照
+    //    被第二次覆盖成"闪到一半的状态"，闪完就回不到真正的闪烁前状态。
+    if (!board.notifyActive) board.savedState = board.currentState
     board.notifyActive = true
     board.notifyAfter = line.length > 7 ? line.slice(7).trim() : ''
     return describe(board, '闪烁中(绿灯 0.15s 亮/0.15s 灭 ×2)')
@@ -223,7 +227,16 @@ function firmwareHandle(cmd, board, nowMs = board.nowMs || 0) {
   }
 
   // 普通状态
-  board.currentState = line
+  //
+  // 对应 .ino 的 applyCommand 普通状态分支，包括那段"作废快照"的修复：
+  // 闪烁期间若有新状态**真的**改变了 currentState，就清空 savedState，
+  // 让闪完落到新状态而不是回滚到旧状态。
+  // 详见固件里 applyCommand 中清空 savedState 的那段注释（真机 bug）。
+  const nextState = line
+  if (board.notifyActive && nextState !== board.currentState) {
+    board.savedState = ''
+  }
+  board.currentState = nextState
   // 对应固件：off/error/alarm/success 会 resetTools()
   if (['off', 'error', 'alarm', 'success'].some((s) => line === s || line.startsWith(s + '+'))) {
     board.toolsActive = false
@@ -233,11 +246,32 @@ function firmwareHandle(cmd, board, nowMs = board.nowMs || 0) {
   return describe(board, '')
 }
 
-/** 闪烁结束后回到目标状态。对应 .ino 里 notify 分支超时后的 applyCommand(target)。 */
+/**
+ * 闪烁结束后回到目标状态。对应 .ino 里 notify 分支超时后的
+ *   String target = notifyAfter; if (空) target = savedState; if (空) target = "off";
+ *   applyCommand(target);
+ *
+ * ⚠️ 两个"空"的处理**必须与固件一致**，否则模拟会造出真机没有的状态：
+ *   - `notifyAfter` 有值 → 切到它（对应 notify <state>）
+ *   - 否则 `savedState` 有值 → 回到闪烁前状态（对应裸 notify 的正常语义）
+ *   - 两者都空 → **保持当前状态不动**
+ *
+ *     固件里那句 `if (target 为空) target = "off"` 看着像"兜底成 off"，其实无害：
+ *     savedState 为空只可能发生在"闪烁期间有新状态改变了 currentState"那条路径上，
+ *     而那时 currentState **已经**是新状态了，`applyCommand("off")` 恰好就是它 ——
+ *     等价于"什么都不做"。
+ *
+ *     模拟器早先是直接 `board.currentState = target`，于是把 currentState
+ *     从 success **打成 off** —— 凭空造出一个固件不会有的状态。
+ *     这个差异是加"闪烁期间新状态不许被回滚"的回归测试时才暴露出来的。
+ */
 function firmwareNotifyFinished(board) {
   board.notifyActive = false
-  const target = board.notifyAfter || board.savedState || 'off'
-  board.currentState = target
+  const target = board.notifyAfter || board.savedState
+  if (target) {
+    board.currentState = target
+  }
+  // target 为空时保持 currentState 不变（对应固件 applyCommand 到同一个值）
   firmwareUpdateToolsEffect(board, board.nowMs)
   return describe(board, '')
 }
@@ -329,6 +363,16 @@ function simulate(events, overrides = {}) {
       steps.push([label, [], describe(board, '')])
       continue
     }
+    if (rawEv === '<<firmware-cmd>>') {
+      // 直接往串口喂一条命令，**跳过插件**。
+      //
+      // 什么时候需要它：要精确控制"两条命令之间是否发生了闪烁结束"，
+      // 或者要验证插件根本不会发出的命令序列。走插件事件流的话，
+      // 每一步都会把 serialLog 里的命令一次跑完，构造不出那个窗口。
+      const r = firmwareHandle(arg, board, board.nowMs)
+      steps.push([label, [arg], r])
+      continue
+    }
     const ev = withIds(rawEv)
     if (ev.type) h.emit(ev.type, ev.data)
     const cmds = h.serialLog.splice(0)
@@ -338,7 +382,13 @@ function simulate(events, overrides = {}) {
       r = firmwareHandle(c, board, board.nowMs)
       last = c
     }
-    if (last) board.savedState = board.currentState
+    // ⚠️ 这里**不能**写 `board.savedState = board.currentState`。
+    //
+    // 早先有这一行，它会在每条命令之后无条件覆盖快照 —— 于是：
+    //   1. 固件 handler 里那句"只在还没在闪时拍快照"被彻底绕过；
+    //   2. 真机的 notify 回滚 bug **在模拟里永远测不出来**（快照总是最新的，
+    //      `board.notifyAfter || board.savedState` 于是变成空操作）。
+    // 快照的时机归 firmwareHandle 管（对应固件 L330），这里不该插手。
     steps.push([label, cmds, r])
   }
   return steps
@@ -511,6 +561,53 @@ await test('场景4：sandbox/mode 同样只闪不改状态', () => {
   assert.deepEqual(cmds, ['notify'])
   const [, , after] = s4[4]
   assert.equal(after.lamps.g, LAMP.SLEEP)
+})
+
+// ---- 场景 11：闪烁窗口内到达的新状态【不许】被回滚（真机 bug 回归） ----
+//
+// 真机 bug 的形态（代码级确认，见固件 applyCommand 里清空 savedState 的注释）：
+//   loop() 先解析执行命令、后进闪烁覆盖层，而快照只在还没在闪时拍。于是
+//     裸 notify → 拍快照 "thinking" → 600ms 内状态变 "success" → 闪完落到
+//     savedState="thinking"，把刚设好的 success 覆盖回旧的 thinking。
+//   而插件那边 #base 已是 success、去重后不会再发 → 灯一直错到下一次真实状态变化。
+//
+// 说明：这里直接喂串口命令（而不是走插件事件），因为要精确控制"两次命令之间
+// 是否发生闪烁结束"——模拟器的事件流是按步骤推进的，走插件反而不好构造这个窗口。
+const s11 = simulate([
+  ['令状态为 thinking', { type: 'assistant/attempt' }],
+  ['收到裸 notify（对应插件发来的 notify）', '<<firmware-cmd>>', 'notify'],
+  ['闪烁窗口内状态变为 success（对应 turn/end）', '<<firmware-cmd>>', 'success'],
+  ['<<notify-finished>>（闪完）', '<<notify-finished>>'],
+])
+printScenario('场景 11：闪烁期间到达的新状态不许被回滚', s11)
+
+await test('场景11：闪烁期间到达的 success 不被回滚成 thinking', () => {
+  // 前置：确实进入了闪烁
+  assert.equal(s11[1][2].blinking, true, '收到 notify 后应处于闪烁中')
+  // 窗口内新状态已应用（绿灯常亮 = success）
+  assert.equal(s11[2][2].lamps.g, LAMP.SOLID, '闪烁期间 success 应立即生效')
+  assert.equal(s11[2][2].lamps.y, LAMP.OFF, 'success 时黄灯应灭')
+  // 关键断言：闪完必须停在 success，而不是回滚到 thinking
+  const after = s11[3][2]
+  assert.equal(after.currentState, 'success', '❌ 闪完被回滚了 —— 这正是真机 bug 的形态')
+  assert.equal(after.lamps.g, LAMP.SOLID, '闪完绿灯应仍是常亮')
+  assert.equal(after.lamps.y, LAMP.OFF, '闪完黄灯应仍是灭的（不是回滚成黄灯呼吸）')
+})
+
+await test('场景11：相邻的「闪完回到闪烁前状态」语义仍然正确', () => {
+  // 反过来也要守：闪烁期间**没有**新状态时，闪完必须回到闪烁前的状态。
+  // （修复不能把这条正常语义一起改坏。）
+  const s = simulate([
+    ['令状态为 error', { type: 'llm/retry' }],
+    ['再变 thinking', { type: 'assistant/attempt' }],
+    ['收到裸 notify', '<<firmware-cmd>>', 'notify'],
+    ['重复的同值命令（不该改变语义）', '<<firmware-cmd>>', 'thinking'],
+    ['<<notify-finished>>（闪完）', '<<notify-finished>>'],
+  ])
+  assert.equal(s[2][2].blinking, true)
+  const after = s[4][2]
+  assert.equal(after.currentState, 'thinking', '没有新状态时，闪完应回到闪烁前的 thinking')
+  assert.equal(after.lamps.y, LAMP.BREATHE, '黄灯恢复呼吸')
 })
 
 // ---- 场景 5：出错 ----

@@ -89,6 +89,31 @@ for (const banned of ['busyCooldownMs', 'busyTimer', 'TOOLS_SUFFIX', 'toolsHold'
 const timerCount = (codeLines.match(/setTimeout/g) || []).length
 check('setTimeout 不超过 2（串口重连 / alarm 回落）', timerCount <= 2, `实际 ${timerCount}`)
 
+// 2c-2. 固件必须保留「闪烁期间新状态不许被回滚」的修复
+//
+// 真机 bug：loop() 先解析执行命令、后进闪烁覆盖层，而快照只在还没在闪时拍。
+// 于是裸 notify 之后 600ms 窗口内到达的新状态会先被应用、再被闪完的回滚覆盖成旧值
+// （"忽略"无害、"应用"也无害，只有"应用完再覆盖成旧的"会坏）。
+// 而插件那边 #base 已是新值、去重后不会再发 → 灯一直错到下一次真实状态变化。
+//
+// 这里只能做**结构断言**：固件跑在板子上，CI 里编译不了也跑不了。
+// 行为断言在 simulate.mjs 的「场景 11」里（那条能真的抓出旧行为，已实测）。
+check(
+  '固件含「闪烁期间新状态作废快照」的修复',
+  /if\s*\(\s*notifyActive\s*&&\s*nextState\s*!=\s*currentState\s*\)/.test(fwSrc) &&
+    /savedState\s*=\s*""/.test(fwSrc),
+)
+check(
+  '固件不再声称「闪烁期间其他状态命令会被忽略」（那是错的说法）',
+  !/notify 闪烁期间，其他状态命令会被暂时忽略/.test(fwSrc),
+)
+check(
+  '固件闪完的兜底不再无条件写 currentState（避免把新状态打成 off）',
+  // 固件是 applyCommand(target)（target 兜底成 off 恰好等于当前状态，无害）；
+  // 模拟器曾是直接赋值 —— 这里断言固件侧确实是走 applyCommand
+  /applyCommand\(target\)/.test(fwSrc),
+)
+
 // 2d. 插件必须只下发这几种命令
 //
 // 注意：源码里有些命令是拼接出来的（`${CMD_NOTIFY} ${cmd}`、`'notify ' + x`），

@@ -67,7 +67,13 @@
  *     OK <cmd>                   执行回执
  *     ERR unknown <text>         无法识别的命令
  *
- *   ★ notify 闪烁期间，其他状态命令会被暂时忽略，保证两下闪完整。
+ *   ★ notify 闪烁期间，其他状态命令**照常执行**（不会被忽略），
+ *     但如果它真的改变了状态，闪烁结束时**落到那个新状态**，而不是回滚到闪烁前的旧状态。
+ *
+ *     旧版这里的注释写的是「其他状态命令会被暂时忽略」——**那是错的**，而且
+ *     实际情况比"忽略"更糟：命令先被应用、闪完再被覆盖回旧值，是三种可能里
+ *     唯一会坏的一种（"忽略"无害，"应用"也无害）。真机 bug 与修法见
+ *     applyCommand 里清空 savedState 的那段注释。
  * ============================================================================
  */
 
@@ -178,7 +184,10 @@ uint32_t toolsOffAtMs       = 0;
 bool     notifyActive  = false;
 uint32_t notifyStartMs = 0;
 String   notifyAfter   = "";     // 闪完之后切到的状态；空 = 回到闪烁前的状态
-String   savedState    = "";     // 闪烁前的状态快照
+String   savedState    = "";     // 闪烁前的状态快照。
+                                 // ⚠️ 闪烁期间若有**新的状态命令真的改变了状态**，
+                                 //    这里会被清空，让闪完落到新状态而不是回滚到旧的。
+                                 //    详见 applyCommand 里清空它的那段注释。
 
 // ===== 底层输出 =====
 void writeLed(uint8_t pin, uint16_t brightness) {
@@ -381,7 +390,28 @@ bool applyCommand(const String &raw) {
   if (canon == "wait")  canon = "alarm";
   if (canon == "done")  canon = "success";
 
-  currentState = planMode ? (canon + "+plan") : canon;
+  const String nextState = planMode ? (canon + "+plan") : canon;
+
+  // ⚠️ 关键：状态**真的**变了，且此刻正在闪 notify —— 把那份"闪烁前的快照"作废。
+  //
+  // 不作废的话会出现这个坏序列（真机 bug）：
+  //   notify（裸的）→ 拍快照 savedState="thinking" → 600ms 内 turn/end 到达
+  //   → 这里把 currentState 设成 "success"，灯切绿
+  //   → 闪完 target = notifyAfter（空）→ target = savedState = "thinking"
+  //   → **把刚设好的 success 覆盖回旧的 thinking**
+  // 而插件那边 #base 已是 success、去重后不会再发，于是灯一直错到下一次真实状态变化。
+  //
+  // 为什么是"清空快照"而不是"置个标志位"：清空之后，闪烁结束时的兜底链
+  //   target = notifyAfter（空）→ savedState（空）→ currentState
+  // 自然落到**新到的**状态，即"最新命令赢"。若改成在结束时特判标志位，
+  // 就得同时处理 notify 与 notify <state> 两种命令，容易漏。
+  //
+  // 只在**值真的变了**时才清：重复的同值命令不该改变"闪完回到闪烁前状态"这个语义。
+  if (notifyActive && nextState != currentState) {
+    savedState = "";
+  }
+
+  currentState = nextState;
 
   // 这些状态意味着「工具那段已经结束」，顺手清掉工具状态，
   // 避免出错/收尾之后绿灯还挂着一个不再有意义的呼吸。
