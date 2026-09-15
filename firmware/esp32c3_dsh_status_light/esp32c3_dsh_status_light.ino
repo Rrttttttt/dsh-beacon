@@ -62,6 +62,12 @@
  *                      然后自动回到「闪烁前的那一刻状态」
  *     notify <state>   绿灯快闪两下，然后切到 <state>
  *
+ *     state?           【诊断命令，不属于插件协议】回两行当前内部状态：
+ *                        STATE <状态> | plan=<> tools=<> notify=<> saved=<> after=<>
+ *                        LAMPS Y=<黄灯效果> G=<绿灯效果> R=<红灯效果>
+ *                      插件永远不会发这条；它是给"验证灯效"用的 ——
+ *                      让每一步都能用串口读出来，不必靠肉眼看灯。
+ *
  *   板子 → 电脑：
  *     ESP32_STATUS_LIGHT READY   上电握手（插件靠它确认板子在）
  *     OK <cmd>                   执行回执
@@ -188,6 +194,17 @@ String   savedState    = "";     // 闪烁前的状态快照。
                                  // ⚠️ 闪烁期间若有**新的状态命令真的改变了状态**，
                                  //    这里会被清空，让闪完落到新状态而不是回滚到旧的。
                                  //    详见 applyCommand 里清空它的那段注释。
+/**
+ * 累计"快照被作废"的次数（诊断用）。
+ *
+ * 为什么需要这个计数器：验证修复时，光看 `saved=` 是**时序上不可靠**的 ——
+ * 一次 `state?` 查询本身要几百毫秒，很容易落在闪烁窗口（600ms）之外，
+ * 那时快照可能已经被重新武装，看起来像"没作废过"。
+ * 实测就因此得到过假失败：修复明明生效，却判定为"没作废"。
+ *
+ * 计数器不受查询时机影响：跑完序列再读，只要次数增加了，就证明那条路径被执行过。
+ */
+uint32_t savedClearedCount = 0;
 
 // ===== 底层输出 =====
 void writeLed(uint8_t pin, uint16_t brightness) {
@@ -320,6 +337,25 @@ void resetTools() {
   toolsHoldPending = false;
 }
 
+/**
+ * 把灯效枚举转成可读的名字（诊断用）。
+ *
+ * 为什么需要它：固件原本**没有任何"查询当前状态"的能力**，验证一个行为只能靠眼睛看灯。
+ * 实测这种验证方式反复出错 —— 分不清"灯没亮"是命令没生效、被覆盖、还是我看错了。
+ * 有了 `state?` 之后，每一步都能用串口读出来。
+ */
+const char *effectName(LampEffect e) {
+  switch (e) {
+    case LAMP_OFF:        return "OFF";
+    case LAMP_SOLID:      return "SOLID";
+    case LAMP_BREATHE:    return "BREATHE";
+    case LAMP_SLEEP:      return "SLEEP";
+    case LAMP_SLOW_BLINK: return "SLOW_BLINK";
+    case LAMP_FAST_BLINK: return "FAST_BLINK";
+    default:              return "?";
+  }
+}
+
 // ===== 命令解析 =====
 // 返回 true 表示命令被接受
 bool applyCommand(const String &raw) {
@@ -327,6 +363,39 @@ bool applyCommand(const String &raw) {
   cmd.trim();
   cmd.toLowerCase();
   if (cmd.length() == 0) return false;
+
+  // ---- state?：诊断用，查询当前内部状态 ----
+  //
+  // ⚠️ 这是**诊断命令，不属于插件协议**。插件永远不会发它。
+  //    它的作用是让"验证灯效"不再依赖肉眼 —— 每一步都能读出来对照。
+  //
+  // 输出（两行，便于人读也便于脚本解析）：
+  //     STATE thinking | plan=0 tools=0 notify=0 saved=<none> after=<none>
+  //     LAMPS Y=BREATHE G=OFF R=OFF
+  if (cmd == "state?" || cmd == "state") {
+    Serial.print("STATE ");
+    Serial.print(currentState);
+    Serial.print(" | plan=");
+    Serial.print(currentState.endsWith("+plan") ? 1 : 0);
+    Serial.print(" tools=");
+    Serial.print(toolsActive ? 1 : 0);
+    Serial.print(" notify=");
+    Serial.print(notifyActive ? 1 : 0);
+    Serial.print(" saved=");
+    Serial.print(savedState.length() == 0 ? "<none>" : savedState);
+    Serial.print(" after=");
+    Serial.print(notifyAfter.length() == 0 ? "<none>" : notifyAfter);
+    Serial.print(" savedcleared=");
+    Serial.println(savedClearedCount);
+
+    Serial.print("LAMPS Y=");
+    Serial.print(effectName(lampYellow.effect));
+    Serial.print(" G=");
+    Serial.print(effectName(lampGreen.effect));
+    Serial.print(" R=");
+    Serial.println(effectName(lampRed.effect));
+    return true;
+  }
 
   // ---- notify [after] ----
   if (cmd == "notify" || cmd.startsWith("notify ")) {
@@ -401,14 +470,18 @@ bool applyCommand(const String &raw) {
   //   → **把刚设好的 success 覆盖回旧的 thinking**
   // 而插件那边 #base 已是 success、去重后不会再发，于是灯一直错到下一次真实状态变化。
   //
-  // 为什么是"清空快照"而不是"置个标志位"：清空之后，闪烁结束时的兜底链
-  //   target = notifyAfter（空）→ savedState（空）→ currentState
-  // 自然落到**新到的**状态，即"最新命令赢"。若改成在结束时特判标志位，
-  // 就得同时处理 notify 与 notify <state> 两种命令，容易漏。
+  // 为什么是"清空快照"而不是"置个标志位"：清空之后，闪烁结束时两个候选都为空，
+  // 固件直接**保持现状**（不调 applyCommand），也就是保留新到的状态 —— "最新命令赢"。
+  // 若改成在结束时特判标志位，就得同时处理 notify 与 notify <state> 两种命令，容易漏。
+  //
+  // ⚠️ 但"清空快照"必须**配合结束时跳过 applyCommand** 才成立。
+  //    早期版本只清了快照、结束时仍走 `target = "off"` 兜底，于是把新状态打成了全灭。
+  //    详见闪烁结束分支里的注释。
   //
   // 只在**值真的变了**时才清：重复的同值命令不该改变"闪完回到闪烁前状态"这个语义。
   if (notifyActive && nextState != currentState) {
     savedState = "";
+    savedClearedCount++;
   }
 
   currentState = nextState;
@@ -488,13 +561,27 @@ void loop() {
     const uint32_t nowNotify = millis();
     if ((uint32_t)(nowNotify - notifyStartMs) >= totalMs) {
       notifyActive = false;
-      // 闪烁结束：切到指定状态，或回到闪烁前的状态
+      // 闪烁结束：切到指定状态，或回到闪烁前的状态。
+      //
+      // ⚠️ 两个都为空时**必须什么都不做**，不能兜底成 "off"。
+      //
+      // 早期版本写的是 `if (target.length()==0) target = "off"; applyCommand(target);`，
+      // 我当时的注释说"applyCommand("off") 恰好等于当前状态、无害"——**那是错的**。
+      // 两个都为空只可能发生在"闪烁期间有新状态真的改变了 currentState"这条路径上
+      // （快照被作废、notifyAfter 本来就没给），而那时 currentState **就是新状态**。
+      // 兜底成 "off" 会把刚设好的新状态打成全灭 —— 真机实测：
+      //   窗口内发 error → 红灯亮起 → 闪完却变成全灭（state=off）
+      // 所以这里在两者皆空时直接跳过，保持现状。
       String target = notifyAfter;
       if (target.length() == 0) target = savedState;
-      if (target.length() == 0) target = "off";
-      applyCommand(target);
-      Serial.print("OK notify -> ");
-      Serial.println(target);
+      if (target.length() > 0) {
+        applyCommand(target);
+        Serial.print("OK notify -> ");
+        Serial.println(target);
+      } else {
+        // 快照与目标都没有：说明闪烁期间来了新状态，保留它，什么都不做
+        Serial.println("OK notify -> (kept current)");
+      }
     } else {
       const uint32_t phase = (uint32_t)(nowNotify - notifyStartMs) % (NOTIFY_ON_MS + NOTIFY_OFF_MS);
       const uint16_t g = (phase < NOTIFY_ON_MS) ? PWM_MAX : 0;

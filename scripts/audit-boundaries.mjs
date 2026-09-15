@@ -107,11 +107,33 @@ check(
   '固件不再声称「闪烁期间其他状态命令会被忽略」（那是错的说法）',
   !/notify 闪烁期间，其他状态命令会被暂时忽略/.test(fwSrc),
 )
+
+// 2c-3. 闪烁结束时**不许**再把空目标兜底成 "off"
+//
+// 这条守的是"修复只做了一半"那个坑。只清空快照是不够的：结束分支里若仍有
+//     if (target.length() == 0) target = "off"; applyCommand(target);
+// 就会把刚设好的新状态**打成全灭**。
+// 真机实测：窗口内发 error → 红灯亮起 → 闪完变全灭（state=off, savedcleared=1）。
+// 正确行为是两者皆空时**保持现状、不调 applyCommand**。
+//
+// ⚠️ 必须查**去掉注释后**的源码：注释里刻意引用了旧代码作为反面教材
+//    （"早期版本写的是 `if (target.length()==0) target = "off"`"），
+//    直接对全文做正则会被自己的注释误伤 —— 实测就这么误报过一次。
+const fwCode = fwSrc
+  .split('\n')
+  .filter((l) => {
+    const t = l.trim()
+    return !(t.startsWith('*') || t.startsWith('//') || t.startsWith('/*'))
+  })
+  .join('\n')
+
 check(
-  '固件闪完的兜底不再无条件写 currentState（避免把新状态打成 off）',
-  // 固件是 applyCommand(target)（target 兜底成 off 恰好等于当前状态，无害）；
-  // 模拟器曾是直接赋值 —— 这里断言固件侧确实是走 applyCommand
-  /applyCommand\(target\)/.test(fwSrc),
+  '固件闪完不再把空目标兜底成 "off" 去 applyCommand',
+  !/if\s*\(\s*target\.length\(\)\s*==\s*0\s*\)\s*target\s*=\s*"off"/.test(fwCode),
+)
+check(
+  '固件闪完在无目标时保持现状（有 target.length() > 0 的分支）',
+  /if\s*\(\s*target\.length\(\)\s*>\s*0\s*\)/.test(fwCode) && /applyCommand\(target\)/.test(fwCode),
 )
 
 // 2d. 插件必须只下发这几种命令

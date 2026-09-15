@@ -57,8 +57,27 @@
 | 电脑 → 板子 | `<state>[\n]`，state ∈ `off` `thinking` `error` `alarm` `success` `plan`，以及 `+plan` 组合形式 |
 | 电脑 → 板子 | `tools on` / `tools off` —— 工具执行状态（**与前景状态正交的独立事实**） |
 | 电脑 → 板子 | `notify [state]` —— 绿灯快闪两下，闪完切到 `state`（不写则回到闪烁前状态） |
+| 电脑 → 板子 | `state?` —— **诊断命令，插件永远不发**。回两行当前内部状态，供验证用（见下） |
 | 板子 → 电脑 | `ESP32_STATUS_LIGHT READY`（上电握手，插件靠它确认板子在） |
 | 板子 → 电脑 | `OK <cmd>`（执行回执） / `ERR unknown <text>` |
+
+### `state?`：诊断命令（不属于插件协议）
+
+它存在的唯一理由是**让"验证灯效"不再依赖肉眼**。固件原本没有任何查询能力，
+验证一个行为只能盯灯看 —— 实测这种方式反复出错（分不清"灯没亮"是命令没生效、
+被后续命令覆盖、还是人看错了）。有了它，每一步都能读出来对照：
+
+```
+> state?
+OK state?
+STATE thinking | plan=0 tools=0 notify=1 saved=thinking after=<none>
+LAMPS Y=BREATHE G=SLEEP R=OFF
+```
+
+- 第一行：内部状态，含 `plan` / `tools` / `notify` 三个标志，以及 `notify` 用的快照与目标
+- 第二行：三颗灯**当前的效果枚举**（`OFF` / `SOLID` / `BREATHE` / `SLEEP` / `SLOW_BLINK` / `FAST_BLINK`）
+
+**插件永远不会发这条命令**，所以它不影响协议一致性。
 
 
 ## 为什么需要插件
