@@ -84,6 +84,10 @@ const TIMING_SYMBOLS = [
   'durationMs',
   'tailMs',
   'blinkMs',
+  // 空闲自动灭灯已整体归固件，插件里不该再出现这些名字（见 audit-boundaries 2a-2）
+  'idleTimeoutMs',
+  'idleTimer',
+  'armIdleTimer',
 ]
 for (const s of TIMING_SYMBOLS) {
   check(`代码里无「${s}」（灯效时序变量）`, !code.includes(s))
@@ -94,19 +98,16 @@ const cfgKeys = Object.keys(DEFAULTS)
 const timingCfg = cfgKeys.filter((k) => /cooldown|hold|fade|tail|blink|duration|period|length|pulse|brightness/i.test(k))
 check('配置项里无灯效时长参数', timingCfg.length === 0, timingCfg.join(', ') || `配置项: ${cfgKeys.join(', ')}`)
 
-// setTimeout 只允许三个既有的兜底（串口重连 / alarm 回落 / 空闲全灭）
+// setTimeout 只允许两个：串口重连 + alarm 回落。
+// （曾有三处：还有一处"空闲兜底"，已随 idleTimeoutMs 一起删除。）
 const timers = [...SRC.matchAll(/setTimeout/g)].length
-check(
-  'setTimeout 仍为 3 个（重连 / alarm 回落 / 空闲兜底，都是安全兜底不是灯效）',
-  timers === 3,
-  `实际 ${timers}`,
-)
+check('setTimeout 为 2 个（串口重连 / alarm 回落，都是安全兜底不是灯效）', timers === 2, `实际 ${timers}`)
 
-// 关键：把三个 setTimeout 的用途列出来，供人工确认
+// 关键：把两个 setTimeout 的用途列出来，供人工确认
 const timerLines = SRC.split('\n')
   .map((l, i) => [i + 1, l])
   .filter(([, l]) => l.includes('setTimeout'))
-console.log('     ── 三个 setTimeout 的实际位置 ──')
+console.log('     ── 两个 setTimeout 的实际位置 ──')
 for (const [n, l] of timerLines) {
   const around = SRC.split('\n').slice(Math.max(0, n - 4), n - 1).map((s) => s.trim()).filter(Boolean)
   console.log(`     第 ${n} 行 ← ${around[around.length - 1] ?? ''}`)

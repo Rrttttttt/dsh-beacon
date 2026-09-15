@@ -96,11 +96,34 @@ const DEFAULTS = Object.freeze({
   baudRate: 115200,
   /** 等申请授权的 alarm 是否超时回落。毫秒；0 = 永不回落。 */
   alarmTimeoutMs: 60000,
-  /** 空闲多久后全灭（防止 DSH 异常退出后灯卡在某个状态）。毫秒；0 = 不自动灭。 */
-  idleTimeoutMs: 300000,
   /** 连不上板子时的重试间隔。毫秒。 */
   reconnectIntervalMs: 5000,
 })
+
+// ---------------------------------------------------------------------------
+// 关于「空闲自动灭灯」为什么没有配置项
+// ---------------------------------------------------------------------------
+// 这里曾有 idleTimeoutMs（默认 300000），和固件里的 STALE_TIMEOUT_MS = 300000
+// 是**同一件事的两份实现**。那是错的，两个原因：
+//
+// 1. **它是个骗人的旋钮。** 固件那份是无条件的，所以把它设成 0（本意"永不自动灭"）
+//    或任何 ≥300000 的值都**不生效** —— 插件的定时器不发 off 了，固件照样在
+//    5 分钟时把灯全灭。
+//
+// 2. **两者语义还不一样，于是会互相打架。**
+//      插件：只在 #dispatch / #reportTools 时重新武装 → 测「多久没有新状态」
+//      固件：在**每条被接受的命令**时重新武装      → 测「多久没有串口活动」
+//    一次很长的推理（例如压缩上下文，thinking 持续几分钟，中间只有不发命令的
+//    step/start 事件）会先触发插件那个定时器，把**正在工作**的灯灭掉；
+//    而固件那边其实还"新鲜"。
+//
+// 所以只剩固件那一份。它更安全（长时间工作不会误灭），而且是**真的**兜底
+// （电脑崩了、插件挂了，板子自己会灭灯）。代价是改超时要重烧固件 ——
+// 但这个值极少改，远比"旋钮能用但会误灭"划算。
+//
+// 固件常量见 firmware/esp32c3_dsh_status_light/esp32c3_dsh_status_light.ino
+// 的 STALE_TIMEOUT_MS。
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // 事件 → 状态 映射表
@@ -519,7 +542,6 @@ class StateMachine {
   #base = null
   #plan = false
   #alarmTimer = null
-  #idleTimer = null
   #stateBeforeAlarm = STATE.THINKING
 
   /**
@@ -579,7 +601,6 @@ class StateMachine {
     const cmd = this.current
     if (cmd === null) return
     this.transport.send(cmd)
-    this.#armIdleTimer()
     this.log(`状态 → ${cmd}`)
   }
 
@@ -647,7 +668,6 @@ class StateMachine {
     if (shouldBeOn === this.#toolsOn) return
     this.#toolsOn = shouldBeOn
     this.transport.send(shouldBeOn ? CMD_TOOLS_ON : CMD_TOOLS_OFF)
-    this.#armIdleTimer()
     this.log(`工具状态 → ${shouldBeOn ? '在跑' : '结束'}`)
   }
 
@@ -682,7 +702,6 @@ class StateMachine {
       const cmd = after.plan ? `${after.foreground}${PLAN_SUFFIX}` : after.foreground
       this.transport.send(`${CMD_NOTIFY} ${cmd}`)
     }
-    this.#armIdleTimer()
   }
 
   /** 处理一个 DSH 会话事件。永不抛出。 */
@@ -832,10 +851,6 @@ class StateMachine {
   dispose() {
     this.#clearAlarmTimer()
     this.#resetTools()
-    if (this.#idleTimer !== null) {
-      clearTimeout(this.#idleTimer)
-      this.#idleTimer = null
-    }
   }
 
   // -- 内部 ----------------------------------------------------------------
@@ -855,23 +870,6 @@ class StateMachine {
       clearTimeout(this.#alarmTimer)
       this.#alarmTimer = null
     }
-  }
-
-  #armIdleTimer() {
-    if (this.#idleTimer !== null) clearTimeout(this.#idleTimer)
-    const ms = Number(this.config.idleTimeoutMs)
-    if (!ms || ms <= 0) return
-    this.#idleTimer = setTimeout(() => {
-      this.#idleTimer = null
-      // 只让板子熄灯，【绝不能】顺手清掉 #plan。
-      // DSH 侧的计划模式这时可能仍然开着，而 #plan 只能由 plan/mode 事件改变。
-      // 早期版本在这里写了 #plan = false，结果空闲 N 分钟后插件永久忘掉计划模式，
-      // 之后所有事件都不再带 +plan（绿灯再也不会亮），直到下一次 plan/mode 事件。
-      // 有回归测试守着这一点。
-      this.#base = STATE.OFF
-      this.#forceDispatch()
-    }, ms)
-    if (typeof this.#idleTimer.unref === 'function') this.#idleTimer.unref()
   }
 }
 

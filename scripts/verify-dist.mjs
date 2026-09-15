@@ -19,13 +19,19 @@
  *   9. 真跑一次插件 apply()，确认产物可用
  *
  * 跑法：node scripts/verify-dist.mjs
+ *
+ * 关于"不开子进程"：
+ *   早先读 zip / tgz 内容用的是 `execFileSync('tar', ...)`。在禁止管道子进程的环境里
+ *   （受限沙箱、加固的 CI 镜像）这会抛 EPERM，把三项检查误报成 FAIL —— 产物其实是好的。
+ *   现在改用 `_archive.mjs`（纯 JS 解析 zip 中央目录 / tar 头）+ 动态 `import()`，
+ *   一个子进程都不开，所以在这个脚本里不存在"环境不允许所以跳过"这种事。
  */
 
-import { readFileSync, existsSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, existsSync, readdirSync } from 'node:fs'
 import { join, dirname } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { createHash } from 'node:crypto'
-import { execFileSync } from 'node:child_process'
+import { listZip, listTarGz, readTarGzText } from './_archive.mjs'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const ROOT = join(HERE, '..')
@@ -153,19 +159,14 @@ check(
 console.log('\n[5] zip 内容')
 // ---------------------------------------------------------------------------
 if (existsSync(ZIP)) {
-  // 用 tar 列 zip 内容（Windows 10+ 自带 bsdtar，能读 zip）
-  let listing = ''
+  let entries = null
   try {
-    listing = execFileSync('tar', ['-tf', ZIP], { encoding: 'utf8' })
+    // 纯 JS 读中央目录，不开子进程
+    entries = listZip(ZIP)
   } catch (e) {
     bad('读取 zip 内容失败', e.message)
   }
-  if (listing) {
-    // bsdtar on Windows prints backslash separators; normalise before matching.
-    const entries = listing
-      .split('\n')
-      .map((s) => s.trim().replace(/\\/g, '/'))
-      .filter(Boolean)
+  if (entries) {
     // Compress-Archive -LiteralPath <folder> 会带上顶层目录名
     const rel = entries.map((e) => e.replace(/^dsh-led-bridge\//, ''))
     check('zip 有顶层目录 dsh-led-bridge/', entries.some((e) => e.startsWith('dsh-led-bridge/')), `${entries.length} 项`)
@@ -193,17 +194,15 @@ if (existsSync(ZIP)) {
 console.log('\n[6] tgz 内容')
 // ---------------------------------------------------------------------------
 if (existsSync(TGZ)) {
-  let listing = ''
+  let rawEntries = null
   try {
-    listing = execFileSync('tar', ['-tzf', TGZ], { encoding: 'utf8' })
+    // 纯 JS 解析 tar 头，不开子进程
+    rawEntries = listTarGz(TGZ).filter((e) => e.type !== '5').map((e) => e.name)
   } catch (e) {
     bad('读取 tgz 内容失败', e.message)
   }
-  if (listing) {
-    const entries = listing
-      .split('\n')
-      .map((s) => s.trim().replace(/\\/g, '/').replace(/^package\//, '').replace(/\/$/, ''))
-      .filter(Boolean)
+  if (rawEntries) {
+    const entries = rawEntries.map((e) => e.replace(/^package\//, '').replace(/\/$/, '')).filter(Boolean)
     const allowed = new Set(['lib/index.js', 'cordis.patch.yml', 'package.json', 'README.md', 'LICENSE'])
     check('tgz 含 lib/index.js', entries.includes('lib/index.js'))
     check('tgz 含 cordis.patch.yml', entries.includes('cordis.patch.yml'))
@@ -227,8 +226,7 @@ if (existsSync(TGZ)) {
     //   自包含目录 → 无 dependencies（依赖树就在旁边，声明了反而触发 allowBuilds）
     //   tarball   → 有 dependencies（没有依赖树，只能靠声明去拉）
     try {
-      const extracted = execFileSync('tar', ['-xzOf', TGZ, 'package/package.json'], { encoding: 'utf8' })
-      const tgzPkg = JSON.parse(extracted)
+      const tgzPkg = JSON.parse(readTarGzText(TGZ, 'package/package.json'))
       check(
         'tgz 声明了 serialport 依赖（否则装了也解析不到原生绑定）',
         tgzPkg.dependencies?.serialport !== undefined,
@@ -263,27 +261,33 @@ if (existsSync(vendorIndex)) {
 // ---------------------------------------------------------------------------
 console.log('\n[8] 真跑一次产物的 apply()')
 // ---------------------------------------------------------------------------
+// 用动态 import() 在当前进程里加载产物，不再开子进程（原因见文件头）。
+// 这样连"环境不让开子进程"这个失败模式都不存在了。
 if (existsSync(vendorIndex)) {
-  const script = `
-import { apply, name } from './lib/index.js'
-const listeners = []
-const ctx = { logger: { info() {} }, on(ev, h) { listeners.push(ev); return () => {} } }
-const dispose = apply(ctx, { port: 'COM_NOT_REAL', reconnectIntervalMs: 999999 })
-if (name !== 'dsh-led-bridge') { console.log('BAD name: ' + name); process.exit(1) }
-if (listeners.length !== 1 || listeners[0] !== 'session/event') { console.log('BAD listeners'); process.exit(1) }
-if (typeof dispose !== 'function') { console.log('BAD dispose'); process.exit(1) }
-dispose()
-console.log('SMOKE_OK')
-`
   try {
-    const out = execFileSync('node', ['--input-type=module', '-e', script], {
-      cwd: VENDOR,
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'pipe'],
-    })
-    check('产物插件可加载并正常 apply/dispose', out.includes('SMOKE_OK'), out.trim().split('\n').pop())
+    const mod = await import(pathToFileURL(vendorIndex).href)
+    const listeners = []
+    const ctx = {
+      logger: { info() {} },
+      on(ev) {
+        listeners.push(ev)
+        return () => {}
+      },
+    }
+    const dispose = mod.apply(ctx, { port: 'COM_NOT_REAL', reconnectIntervalMs: 999999 })
+    const problems = []
+    if (mod.name !== 'dsh-led-bridge') problems.push(`name=${mod.name}`)
+    if (listeners.length !== 1 || listeners[0] !== 'session/event') problems.push(`listeners=${listeners.join('|')}`)
+    if (typeof dispose !== 'function') problems.push('dispose 不是函数')
+    if (typeof dispose === 'function') dispose()
+
+    check(
+      '产物插件可加载并正常 apply/dispose',
+      problems.length === 0,
+      problems.length ? problems.join('; ') : 'name/listeners/dispose 都正确',
+    )
   } catch (e) {
-    bad('产物插件加载失败', (e.stderr || e.message || '').toString().trim().slice(0, 300))
+    bad('产物插件加载失败', (e && e.message ? e.message : String(e)).slice(0, 300))
   }
 } else {
   bad('缺 lib/index.js，跳过 smoke test')

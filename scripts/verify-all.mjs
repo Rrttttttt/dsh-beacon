@@ -17,7 +17,7 @@
  *     node scripts/verify-all.mjs --live   # 外加 F，需要板子空闲
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawnSync } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -35,12 +35,51 @@ function check(group, label, ok, detail = '') {
   else fail++
 }
 
-function runNode(relPath) {
+/**
+ * 跑一个子脚本，返回它的结果。
+ *
+ * 为什么要处理 EPERM：`execFileSync` 默认用**管道**接子进程输出。有些环境禁止
+ * 打开管道（受限沙箱、部分企业策略、加固过的 CI 镜像），这时会抛
+ * `spawnSync ... EPERM`。早先的实现把它和"子脚本真的失败"混为一谈 —— 直接判 FAIL。
+ *
+ * 实测过这个误判：在禁管道环境下，selftest.mjs 直接跑 49/49 退出码 0、
+ * simulate.mjs 直接跑 28/28 退出码 0，但 verify-all 却报"2 项失败"。
+ *
+ * 现在分三种结果：
+ *   ok: true            子脚本退出码 0
+ *   ok: false           子脚本真的失败了（带 FAIL 输出）
+ *   ok: false, env:true 环境不让开管道 —— 用 inherit 重跑，靠退出码判定
+ *
+ * 注意"环境不支持"和"检查失败"必须区分开：把前者报成 FAIL 会让人去查不存在的 bug，
+ * 正是这条修正要避免的。
+ *
+ * @param {string} relPath 相对仓库根的脚本路径
+ * @param {string} label   用于日志的短名
+ */
+function runNode(relPath, label) {
   try {
-    const out = execFileSync(process.execPath, [join(ROOT, relPath)], { encoding: 'utf8' })
-    return { ok: true, out }
+    return { ok: true, out: execFileSync(process.execPath, [join(ROOT, relPath)], { encoding: 'utf8' }) }
   } catch (e) {
-    return { ok: false, out: (e.stdout || '') + (e.stderr || '') }
+    // e.stdout / e.stderr 在"禁止管道"时是 undefined，所以要用 e.status 判断
+    const piped = e.stdout !== undefined || e.stderr !== undefined
+    if (piped) return { ok: false, out: (e.stdout || '') + (e.stderr || '') }
+
+    // 没有捕获到任何输出，说明这次不是子脚本失败，而是我们没法接它的输出。
+    // 降级：让子进程直接继承本进程的 stdio，靠退出码判定。
+    console.log(`  --   [${label}] 无法用管道捕获输出（受限环境），改用 inherit 重跑`)
+    let status = null
+    let spawnErr = null
+    try {
+      const r = spawnSync(process.execPath, [join(ROOT, relPath)], { stdio: 'inherit' })
+      status = r.status
+      spawnErr = r.error || null
+    } catch (err) {
+      spawnErr = err
+    }
+    if (spawnErr) {
+      return { ok: false, env: true, out: `${label} 无法在本环境运行：${spawnErr.message}` }
+    }
+    return { ok: status === 0, out: '' }
   }
 }
 
@@ -59,12 +98,20 @@ check('A', '固件尾窗 = 一个呼吸周期', /TOOLS_HOLD_MS\s*=\s*BREATHE_PER
 check('A', '固件含撤销叠加（applyStateEffects 在收尾分支）', /applyStateEffects\(currentState/.test(fwSrc))
 
 console.log('\n========== B/C. 单元自测 + 端到端模拟 ==========')
-const st = runNode('scripts/selftest.mjs')
-check('B', 'selftest.mjs 全绿', st.ok, st.ok ? '' : '见下方输出')
-if (!st.ok) console.log(st.out.split('\n').filter((l) => l.includes('FAIL')).join('\n'))
-const sim = runNode('scripts/simulate.mjs')
-check('C', 'simulate.mjs 全绿', sim.ok, sim.ok ? '' : '见下方输出')
-if (!sim.ok) console.log(sim.out.split('\n').filter((l) => l.includes('FAIL')).join('\n'))
+const st = runNode('scripts/selftest.mjs', 'B')
+if (st.env) {
+  check('B', 'selftest.mjs 全绿', false, '本环境无法运行子进程（见上）')
+} else {
+  check('B', 'selftest.mjs 全绿', st.ok, st.ok ? '' : '见下方输出')
+  if (!st.ok) console.log(st.out.split('\n').filter((l) => l.includes('FAIL')).join('\n'))
+}
+const sim = runNode('scripts/simulate.mjs', 'C')
+if (sim.env) {
+  check('C', 'simulate.mjs 全绿', false, '本环境无法运行子进程（见上）')
+} else {
+  check('C', 'simulate.mjs 全绿', sim.ok, sim.ok ? '' : '见下方输出')
+  if (!sim.ok) console.log(sim.out.split('\n').filter((l) => l.includes('FAIL')).join('\n'))
+}
 
 console.log('\n========== D. 协议一致性 ==========')
 const pluginObj = await import(pathToFileURL(pluginIndex).href)
@@ -73,7 +120,7 @@ const { StateMachine, DEFAULTS, CMD_NOTIFY, PLAN_SUFFIX } = pluginObj.__testing
 // 让真实状态机跑一遍典型事件，收集它真正会下发的命令
 const sent = []
 const fakeTransport = { send: (c) => sent.push(c) }
-const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, fakeTransport, () => {})
+const m = new StateMachine({ alarmTimeoutMs: 0 }, fakeTransport, () => {})
 const script = [
   { type: 'turn/start' },
   { type: 'assistant/attempt' },

@@ -46,15 +46,8 @@ for (const [name, src] of [['plugin/lib/index.js', pluginSrc], ['固件 .ino', f
 
 console.log('\n[2] 插件不得持有任何灯效时序（架构边界）')
 
-// 2a. 运行时配置集合：不允许出现时长类键
-const cfgKeys = Object.keys(pluginObj.__testing.DEFAULTS)
-const TIMING_RE = /cooldown|hold|fade|tail|blink|duration|period|interval|ms$/i
-// reconnectIntervalMs 是"连不上板子时多久重试"，属于连接策略，不是灯效时序，白名单放行
-const ALLOWED = new Set(['port', 'vendorId', 'productId', 'baudRate', 'alarmTimeoutMs', 'idleTimeoutMs', 'reconnectIntervalMs'])
-const timingKeys = cfgKeys.filter((k) => TIMING_RE.test(k) && !ALLOWED.has(k))
-check('配置里无灯效时长参数', timingKeys.length === 0, timingKeys.join(', '))
-
-// 2b. 源码里不允许出现灯效时序相关标识符（注释里的历史说明除外）
+// 去掉注释后的源码。所有"标识符是否存在"的检查都在这个上面做，
+// 否则注释里的历史说明（比如解释为什么删掉 idleTimeoutMs）会误伤。
 const codeLines = pluginSrc
   .split('\n')
   .filter((l) => {
@@ -63,14 +56,38 @@ const codeLines = pluginSrc
   })
   .join('\n')
 
+// 2a. 运行时配置集合：不允许出现时长类键
+const cfgKeys = Object.keys(pluginObj.__testing.DEFAULTS)
+const TIMING_RE = /cooldown|hold|fade|tail|blink|duration|period|interval|ms$/i
+// 白名单只放两个，都必须能说清"为什么它不是灯效时序"：
+//   alarmTimeoutMs       等你确认的兜底 —— 是"防止灯卡在 alarm"，不是灯效渲染节奏
+//   reconnectIntervalMs  连不上板子多久重试 —— 是连接策略
+// 注意 idleTimeoutMs **不在**这里，它是被刻意删除的（见 2a-2）。
+const ALLOWED = new Set(['port', 'vendorId', 'productId', 'baudRate', 'alarmTimeoutMs', 'reconnectIntervalMs'])
+const timingKeys = cfgKeys.filter((k) => TIMING_RE.test(k) && !ALLOWED.has(k))
+check('配置里无灯效时长参数', timingKeys.length === 0, timingKeys.join(', '))
+
+// 2a-2. 空闲自动灭灯必须**只**在固件里
+//
+// 这条守的是一个删除。插件的 idleTimeoutMs 与固件的 STALE_TIMEOUT_MS 曾是同一件事的
+// 两份实现，后果是「旋钮是假的」（固件无条件生效）+「语义打架」（长推理被误灭灯）。
+// 删掉之后必须两边都盯着，否则一旦有人加回来，或固件那边被拿掉，
+// 就变成"两边都有"或"两边都没有"。
+check('插件里无 idle 相关标识符（空闲灭灯归固件）', !/idleTimer|armIdleTimer|idleTimeoutMs/.test(codeLines))
+check(
+  '固件确实持有唯一的空闲兜底（STALE_TIMEOUT_MS 并被执行）',
+  /STALE_TIMEOUT_MS/.test(fwSrc) &&
+    /currentState\s*!=\s*"off"\s*&&\s*\(now\s*-\s*lastCommandMs\)\s*>\s*STALE_TIMEOUT_MS/.test(fwSrc),
+)
+
 for (const banned of ['busyCooldownMs', 'busyTimer', 'TOOLS_SUFFIX', 'toolsHold', 'toolsOffAt']) {
   check(`插件代码里无 ${banned}`, !codeLines.includes(banned))
 }
 
-// 2c. 只允许两处 setTimeout：alarm 回落 + 空闲兜底（都是"防止电脑异常"的兜底，
-//     不是灯效时序）。另外 LedTransport 的重连定时器在连接层，也算合理。
+// 2c. 只允许两处 setTimeout：串口重连 + alarm 回落。
+//     （曾经还有第三处"空闲兜底"，已随 idleTimeoutMs 一起删除，见 2a-2。）
 const timerCount = (codeLines.match(/setTimeout/g) || []).length
-check('setTimeout 数量不超过 3（alarm 回落 / 空闲兜底 / 串口重连）', timerCount <= 3, `实际 ${timerCount}`)
+check('setTimeout 不超过 2（串口重连 / alarm 回落）', timerCount <= 2, `实际 ${timerCount}`)
 
 // 2d. 插件必须只下发这几种命令
 //

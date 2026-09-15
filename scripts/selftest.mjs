@@ -12,7 +12,12 @@
  */
 
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import { __testing } from '../plugin/lib/index.js'
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 const { EVENT_SETS, STATE, looksLikeFailure, pickPortPath, StateMachine, PLAN_MODE_EVENT, CMD_NOTIFY } = __testing
 
@@ -220,7 +225,7 @@ function fakeTransport() {
 /** 造一个状态机实例（配置全默认，只是不需要真的串口）。 */
 function machine() {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   return { m, t }
 }
 
@@ -369,38 +374,43 @@ await test('session/end-seed 会同时清掉计划模式', () => {
   assert.equal(m.current, 'off')
 })
 
-await test('空闲超时熄灯后，计划模式必须保留（不能永久丢失）', () => {
-  // 用一个会立刻触发的空闲超时来模拟「5 分钟没动静」
-  const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 1 }, t, () => {})
-  m.handle({ type: PLAN_MODE_EVENT, data: { active: true } })
-  assert.equal(t.last(), 'plan')
+await test('空闲自动灭灯已整体归固件：插件里不能再有这份实现', () => {
+  // 这条锁住一个**删除**，不是新增功能，所以它检查的是「不存在」。
+  //
+  // 背景：插件曾有 idleTimeoutMs（默认 300000），与固件的 STALE_TIMEOUT_MS
+  // 是同一件事的两份实现。那是错的：
+  //   1. 它是个骗人的旋钮 —— 固件那份无条件生效，所以设成 0 或 ≥300000 都不起作用。
+  //   2. 两者语义不同 —— 插件测「多久没有新状态」，固件测「多久没有串口活动」，
+  //      于是长推理会被插件误灭灯。
+  // 现在只剩固件那一份。
+  const forbidden = ['idleTimeoutMs', 'idleTimer', 'armIdleTimer']
+  const src = readFileSync(join(ROOT, 'plugin', 'lib', 'index.js'), 'utf8')
+  // 去掉注释再看，否则历史说明里提到的名字会误伤
+  const code = src
+    .split('\n')
+    .filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l))
+    .join('\n')
+  for (const name of forbidden) {
+    assert.ok(!code.includes(name), `插件代码里不该再有 ${name}（空闲灭灯归固件）`)
+  }
 
-  return new Promise((resolve, reject) => {
-    setTimeout(() => {
-      try {
-        // 计划模式开着时「熄灯」= 全灭 + 绿灯常亮，所以下发的是 plan（不是 off）
-        assert.equal(t.last(), 'plan', `空闲后应熄灯（plan 命令即全灭+绿灯常亮），实际 ${t.last()}`)
-        // 关键：DSH 侧的 plan mode 仍然开着，插件不能忘掉它
-        m.handle({ type: 'assistant/attempt' })
-        assert.equal(
-          t.last(),
-          'thinking+plan',
-          '空闲过后再有事件，绿灯必须跟着回来；若发的是 thinking 就说明计划模式被永久丢了',
-        )
-        resolve()
-      } catch (err) {
-        reject(err)
-      }
-    }, 40)
-  })
+  // 配置项也不能有，否则又是个骗人的旋钮
+  assert.ok(!('idleTimeoutMs' in __testing.DEFAULTS), 'DEFAULTS 里不该再有 idleTimeoutMs')
+
+  // 固件那边必须确实持有它 —— 否则就成了两边都没有，灯永远不灭
+  const fwSrc = readFileSync(join(ROOT, 'firmware', 'esp32c3_dsh_status_light', 'esp32c3_dsh_status_light.ino'), 'utf8')
+  assert.ok(/STALE_TIMEOUT_MS/.test(fwSrc), '固件必须持有 STALE_TIMEOUT_MS（唯一的空闲兜底）')
+  assert.ok(
+    /currentState\s*!=\s*"off"\s*&&\s*\(now\s*-\s*lastCommandMs\)\s*>\s*STALE_TIMEOUT_MS/.test(fwSrc),
+    '固件里必须有真正执行这个超时的判断',
+  )
 })
 
 console.log('\n[4d] 状态机：工具上报（只报事实，不做灯效时序）')
 
 await test('tool/call → 前景 thinking + 独立上报 tools on', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle(evCall())
   assert.deepEqual(t.sent, ['thinking', 'tools on'])
   assert.equal(m.toolsReported, true)
@@ -409,7 +419,7 @@ await test('tool/call → 前景 thinking + 独立上报 tools on', () => {
 
 await test('tool/result（最后一个工具）→ 立即上报 tools off，不带延迟', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   const [call, result] = evToolPair()
   m.handle(call)
   t.clear()
@@ -422,7 +432,7 @@ await test('tool/result（最后一个工具）→ 立即上报 tools off，不�
 
 await test('连续工具期间每对 call/result 只产生一开一关，thinking 事件不插话', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle({ type: 'assistant/attempt' })   // thinking
   m.handle(evCall())                        // tools on
   t.clear()
@@ -445,7 +455,7 @@ await test('连续工具期间每对 call/result 只产生一开一关，thinkin
 
 await test('两个并发工具：只结束一个时不上报 off（按 ID 精确配对）', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   const [c1, r1] = evToolPair()
   const [c2] = evToolPair()
   m.handle(c1)
@@ -459,7 +469,7 @@ await test('两个并发工具：只结束一个时不上报 off（按 ID 精确
 
 await test('收工事件比开工多也不会带偏状态（真机根因：result 比 call 多 10 个）', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   // 真机上 tool/result 会比 tool/call 多（command/done 等也算收工）。
   // 旧版盲计数会被这些多余的收工事件带偏；新版只认配对得上的 ID。
   for (let i = 0; i < 10; i++) m.handle(evResult('call_不存在的ID'))
@@ -478,7 +488,7 @@ await test('未闭合的 tool/call（等不到 result）会被轮次边界收掉
   // 真机实测：最后一个 tool/call 有时永远等不到配对 result，
   // 旧版会永远停在 tools on，绿灯一直呼吸不灭。
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle(evCall())
   assert.equal(m.toolsReported, true, '前置条件：工具在跑')
   assert.equal(m.activeCount, 1)
@@ -492,7 +502,7 @@ await test('未闭合的 tool/call（等不到 result）会被轮次边界收掉
 
 await test('turn/start 也会对账，清掉跨轮残留', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle(evCall())
   t.clear()
   m.handle({ type: 'turn/start' })
@@ -503,7 +513,7 @@ await test('turn/start 也会对账，清掉跨轮残留', () => {
 
 await test('thinking 事件不碰工具状态（这是真机踩到的频闪根因）', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle(evCall())
   assert.equal(m.toolsReported, true)
   t.clear()
@@ -516,7 +526,7 @@ await test('thinking 事件不碰工具状态（这是真机踩到的频闪根�
 
 await test('工具失败 → 清掉工具状态并亮红灯', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   const [call] = evToolPair()
   m.handle(call)
   t.clear()
@@ -529,7 +539,7 @@ await test('工具失败 → 清掉工具状态并亮红灯', () => {
 
 await test('没有配对的 result 事件不会产生任何残留', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   for (let i = 0; i < 3; i++) m.handle(evResult('call_孤立的'))
   t.clear()
   m.handle(evCall())
@@ -543,7 +553,7 @@ await test('command/done 只关工具，【不】改前景状态（不许顺手�
   // 于是 /compact 之类的斜杠命令结束时绿灯会常亮 —— 旧版本里它前景纹丝不动。
   // 那是对用户可见行为的擅自改动，已撤回，并用这条测试钉住。
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle({ type: 'assistant/attempt' })            // 前景 → thinking
   t.clear()
   m.handle({ type: 'command/done', data: { commandId: 'c1', kind: 'success', text: 'ok' } })
@@ -554,7 +564,7 @@ await test('command/done 只关工具，【不】改前景状态（不许顺手�
 
 await test('command/done 仍能正确关闭配对的 command/run', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle({ type: 'command/run', data: { commandId: 'c9', name: 'compact', source: { kind: 'user' } } })
   assert.equal(m.toolsReported, true, 'command/run 应算作"有活在跑"')
   t.clear()
@@ -567,7 +577,7 @@ await test('command/done 仍能正确关闭配对的 command/run', () => {
 
 await test('计划模式 + 工具：状态带 +plan，工具仍独立上报', () => {
   const t = fakeTransport()
-  const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+  const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
   m.handle({ type: PLAN_MODE_EVENT, data: { active: true } })
   t.clear()
   const [call, result] = evToolPair()
@@ -586,7 +596,7 @@ await test('收尾 / 出错 / 等确认 都会清掉工具状态', () => {
     ['approval/asked', { type: 'approval/asked', data: { id: 'a', toolName: 't' } }],
   ]) {
     const t = fakeTransport()
-    const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+    const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
     m.handle(evCall())
     assert.equal(m.toolsReported, true, `${label}: 前置条件`)
     t.clear()
@@ -615,7 +625,7 @@ await test('退出计划模式必须保留前景状态（尤其不能把 error �
     [[{ type: 'turn/end' }], 'success', '答完'],
   ]) {
     const t = fakeTransport()
-    const m = new StateMachine({ alarmTimeoutMs: 0, idleTimeoutMs: 0 }, t, () => {})
+    const m = new StateMachine({ alarmTimeoutMs: 0 }, t, () => {})
     m.handle({ type: PLAN_MODE_EVENT, data: { active: true } })
     for (const ev of setup) m.handle(ev)
     t.clear()

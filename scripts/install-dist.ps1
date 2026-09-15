@@ -235,6 +235,34 @@ Write-Ok "staged at $safeRoot (including node_modules)"
 $installPath = $safeRoot
 
 # ---------------------------------------------------------------------------
+# 5b. Detect a leftover install from the older, single-shared-folder layout
+# ---------------------------------------------------------------------------
+# Releases up to v0.2.2 staged every profile into ONE folder named without the
+# profile suffix ($dshHome\plugins\<name>). Since v0.2.3 each profile gets its own
+# ($dshHome\plugins\<name>-<profile>), so upgrading leaves the old folder behind as
+# an orphan that nothing references any more.
+#
+# We report it rather than delete it: the old folder is shared by construction, so
+# another profile could still be linked to it, and silently removing it would break
+# that profile. Deleting is the user's call.
+$legacyRoot = Join-Path $dshHome "plugins\$pluginName"
+if ((Test-Path -LiteralPath $legacyRoot) -and ($legacyRoot -ne $safeRoot)) {
+    Write-Warn 'Found an install from the older layout:'
+    Write-Host "      $legacyRoot"
+    Write-Host '    Nothing in this profile points at it any more (that folder used to be'
+    Write-Host '    shared by every profile). Before deleting it, confirm no other profile'
+    Write-Host '    still links to it:'
+    Write-Host "      Get-ChildItem `"$dshHome\profiles`" -Directory | ForEach-Object {"
+    Write-Host "        `$l = Join-Path `$_.FullName 'node_modules\$pluginName'"
+    Write-Host "        if (Test-Path `$l) { `"`$(`$_.Name) -> `$((Get-Item `$l -Force).Target)`" }"
+    Write-Host '      }'
+    Write-Host '    If no profile lists it, it is safe to remove:'
+    Write-Host "      Remove-Item -Recurse -Force `"$legacyRoot`""
+} else {
+    Write-Ok 'no leftover install from the older layout'
+}
+
+# ---------------------------------------------------------------------------
 # 6. Register the plugin with DSH
 # ---------------------------------------------------------------------------
 Write-Step "Registering the plugin into profile '$Profile'"
