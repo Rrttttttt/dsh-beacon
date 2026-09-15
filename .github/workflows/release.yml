@@ -58,6 +58,9 @@ jobs:
         run: |
           node scripts/verify-all.mjs
           node scripts/verify-no-lamp-logic.mjs
+          node scripts/audit-boundaries.mjs
+          # 守卫：不许再有依赖管道子进程的验证脚本（这个坑犯过两次）
+          node scripts/verify-no-pipe-deps.mjs
 
       - name: Build artifacts
         shell: pwsh
@@ -67,6 +70,14 @@ jobs:
       - name: Verify artifacts
         shell: pwsh
         run: node scripts/verify-dist.mjs
+
+      # 打包可复现性：跨 PowerShell 版本产出的字节必须一致。
+      # 放在打包之后，因为它要读 pack.ps1 的源码断言、并检查 write-json.ps1 的行为。
+      # 注意：CI 的 windows-latest 通常只有一种 PowerShell，所以"跨版本比对"会跳过 ——
+      # 它仍会验证"产出的是规范字节"，以及"打包脚本不再用随版本变字节的 cmdlet"。
+      - name: Verify reproducibility
+        shell: pwsh
+        run: node scripts/verify-reproducible.mjs
 
       - name: Show artifact summary
         shell: pwsh

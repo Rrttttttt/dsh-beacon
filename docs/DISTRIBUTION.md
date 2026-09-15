@@ -199,6 +199,63 @@ npm publish --access public
 
 记在这里是为了**别重犯**，尤其是那些"表面成功、实际坏掉"的类型。
 
+### v0.2.5：同一个坑犯了第二次 —— 而且守卫本身没人跑
+
+**症状**：`verify-reproducible.mjs`（v0.2.4 新增，用来守 N1 的）在禁止管道的环境里报
+
+```
+[1] 盘点本机可用的 PowerShell 版本
+  FAIL 一个 PowerShell 都没找到 —— 无法验证打包可复现性
+```
+
+**它说错了原因**：本机确实装着 PowerShell 7.6.6，真因是环境禁止管道子进程。
+这比假失败更糟 —— 会把人引去装一个已经装好的东西。
+
+**根因**：`probe()` 用 `spawnSync(..., { stdio: ['ignore','pipe','ignore'] })` 接输出。
+受限环境里这返回 `{status:null, error:EPERM}`，而代码 `catch` 后一律返回 null，
+于是 6 个候选全被判为"不存在"。同一文件里调 `write-json.ps1` 也用了
+`['ignore','pipe','pipe']`，同样会挂。
+
+**这是 v0.2.3 刚修掉的 P1/P2 的同一类 bug**，项目甚至为此写了 `_inject-nopipe.mjs`
+专门防它（`verify-all.mjs` 有 EPERM 降级、`verify-dist.mjs` 干脆不开子进程）——
+但 v0.2.4 新增的那个文件又带回来了。
+
+**修法**：不用降级，而是**绕过** —— 把 stdout/stderr 重定向到临时文件
+（`stdio: ['ignore', fd, 'ignore']`），文件不受"禁止管道"的限制。
+实测在注入故障的环境下，两个 PowerShell 都被正常探测到，**检查真的执行了**，
+不是跳过。同时 EPERM 若仍发生（其他原因），报「本环境禁止启动子进程（EPERM）」，
+明确区别于"没找到 PowerShell"。
+
+### 真正的元问题：守卫没人跑
+
+`verify-reproducible.mjs` 既不在 CI 的验证步骤里，也不在 README 的验证清单里，
+只在一份文档里被提过。也就是说 **N1 的回归守卫等于不存在**：
+
+- CI（`release.yml`）只跑 `verify-all` / `verify-no-lamp-logic` / `pack.ps1` / `verify-dist`
+- README 的清单只有 4 条，没有它
+- 真去跑它的人会得到一个误导性的失败
+
+**修法**：把它加进 `release.yml` 与 README 清单，并补上 `audit-boundaries.mjs`
+（同样漏了）。README 里加一句「改完验证脚本记得同步 CI —— 早先就是漏了」。
+
+> 教训：**没有接进 CI 的守卫不是守卫。** 写一个检查却没人跑，比不写更危险 ——
+> 它给人一种"已经被守住了"的错觉。
+
+### 顺带：注入器自己有个漏洞，导致它给出假绿
+
+`_inject-nopipe.mjs` 判断"是否用管道"时只看了 `stdio === undefined` / `'pipe'`，
+**漏了数组形式** `['ignore','pipe','ignore']`。于是它对这类调用直接放行，
+声称"已注入故障"但实际没注入 —— 依赖它的守卫检查因此给出假绿。
+R1 第一次用它复现时就没复现出来，正是这个原因。
+
+**修法**：用 `Array.isArray(stdio) && stdio.includes('pipe')` 覆盖三种写法。
+并新增 `verify-no-pipe-deps.mjs` 做**元自测**：
+- 扫描 `scripts/*.mjs` 里所有 `spawnSync/spawn/execFileSync/execSync` 调用，
+  凡是用管道接输出的必须在白名单里（目前白名单为空），否则 FAIL 并给出三种改法
+- 断言注入器确实用 `Array.isArray` + `includes` 处理数组形式
+
+> 这个坑在本项目已犯两次（v0.2.3、v0.2.4），靠人记着不管用，所以改成自动扫源码。
+
 ### v0.2.4：打包**不可复现** —— 下载的包没法核对
 
 **症状**：同一个 commit，`powershell -File scripts/pack.ps1`（README 教用户跑的）

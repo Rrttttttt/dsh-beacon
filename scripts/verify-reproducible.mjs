@@ -31,7 +31,7 @@
  */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { join, dirname } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -53,23 +53,65 @@ const sha256 = (buf) => createHash('sha256').update(buf).digest('hex').toUpperCa
 // ---------------------------------------------------------------------------
 console.log('\n[1] 盘点本机可用的 PowerShell 版本')
 // ---------------------------------------------------------------------------
+
+/**
+ * 探测一个 PowerShell 可执行文件的版本。
+ *
+ * 关键设计：**不用管道接输出**，而是把 stdout 重定向到一个临时文件。
+ * 受限环境（沙箱、企业策略、加固的 CI 镜像）会禁止打开管道子进程，那时
+ * `spawnSync(..., { stdio: ['ignore','pipe','ignore'] })` 返回
+ * `{status: null, error: EPERM}`。早先的实现把这和"这个 exe 不存在"混为一谈 ——
+ * 于是 6 个候选全被判为不存在，报出「一个 PowerShell 都没找到」，
+ * **把人引去装 pwsh（本机其实装着）**，而真因是环境禁止管道。
+ *
+ * 重定向到文件就没有这个限制，所以是**绕过**而不是降级。
+ *
+ * @returns {{ok: true, exe: string, version: string}
+ *          |{ok: false, reason: 'missing'}
+ *          |{ok: false, reason: 'env', detail: string}}
+ */
 function probe(exe) {
+  const outFile = join(tmpdir(), `dsh-psver-${process.pid}-${Math.random().toString(36).slice(2)}.txt`)
+  let fd = null
   try {
+    fd = openSync(outFile, 'w')
     const r = spawnSync(exe, ['-NoProfile', '-Command', '$PSVersionTable.PSVersion.ToString()'], {
-      encoding: 'utf8',
-      stdio: ['ignore', 'pipe', 'ignore'],
+      stdio: ['ignore', fd, 'ignore'],
     })
-    if (r.status !== 0 || !r.stdout) return null
-    const v = String(r.stdout).trim()
-    return v ? { exe, version: v } : null
-  } catch {
-    return null
+    closeSync(fd)
+    fd = null
+
+    if (r.error) {
+      // EPERM/ENOENT 要分开：前者是环境不允许，后者才是这个 exe 不存在
+      if (r.error.code === 'EPERM' || r.error.code === 'EACCES') {
+        return { ok: false, reason: 'env', detail: r.error.code }
+      }
+      return { ok: false, reason: 'missing' }
+    }
+    if (r.status !== 0) return { ok: false, reason: 'missing' }
+
+    const version = readFileSync(outFile, 'utf8').trim()
+    return version ? { ok: true, exe, version } : { ok: false, reason: 'missing' }
+  } catch (e) {
+    if (e && (e.code === 'EPERM' || e.code === 'EACCES')) {
+      return { ok: false, reason: 'env', detail: e.code }
+    }
+    return { ok: false, reason: 'missing' }
+  } finally {
+    if (fd !== null) {
+      try {
+        closeSync(fd)
+      } catch {
+        /* 已经关了 */
+      }
+    }
+    rmSync(outFile, { force: true })
   }
 }
 
 /** 同一台机器上可能有多个 PowerShell，全部找出来 —— 版本越多这个检查越有意义 */
 const shells = []
-const seen = new Set()
+const envBlocked = []
 for (const cand of [
   process.env.PWSH_EXE,
   'C:\\Program Files\\PowerShell\\7\\pwsh.exe',
@@ -78,12 +120,23 @@ for (const cand of [
   'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe',
   'powershell.exe',
 ]) {
-  if (!cand || seen.has(cand)) continue
-  seen.add(cand)
+  if (!cand) continue
   const p = probe(cand)
-  if (!p) continue
+  if (!p.ok) {
+    if (p.reason === 'env') envBlocked.push(cand)
+    continue
+  }
   if (shells.some((s) => s.version === p.version)) continue
   shells.push(p)
+}
+
+if (shells.length === 0 && envBlocked.length > 0) {
+  // 明确区分「环境不允许」和「真的没装」—— 前者不该报 FAIL
+  note(`本环境禁止启动子进程（${envBlocked[0]} 报 EPERM），无法盘点 PowerShell 版本`)
+  note('这不是"没找到 PowerShell"，本机可能装着 —— 换一个不受限的终端再跑')
+  note('跳过跨版本比对')
+  console.log('\n结果：本环境无法运行此项检查（已跳过，不算失败）\n')
+  process.exit(0)
 }
 
 if (shells.length === 0) {
@@ -117,17 +170,43 @@ try {
   const canonicalHash = sha256(Buffer.from(canonical, 'utf8'))
 
   const results = []
+  const envFailures = []
   for (const s of shells) {
-    const target = join(tmp, `sample-${s.version.replace(/[^\w.]/g, '_')}.json`)
+    const safeVer = s.version.replace(/[^\w.]/g, '_')
+    const target = join(tmp, `sample-${safeVer}.json`)
+    const errFile = join(tmp, `err-${safeVer}.txt`)
     // 先用 PowerShell 自己写一份（模拟 pack.ps1 里"读对象→写文件"的路径）
     writeFileSync(target, JSON.stringify(sample), 'utf8')
-    const r = spawnSync(
-      s.exe,
-      ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(ROOT, 'scripts', 'write-json.ps1'), '-Path', target],
-      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
-    )
-    if (r.status !== 0) {
-      bad(`PowerShell ${s.version} 跑 write-json.ps1 失败：${(r.stderr || r.stdout || '').slice(0, 300)}`)
+
+    // stderr 也重定向到文件 —— 不用管道，理由同 probe()。
+    let errFd = null
+    let r
+    try {
+      errFd = openSync(errFile, 'w')
+      r = spawnSync(
+        s.exe,
+        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', join(ROOT, 'scripts', 'write-json.ps1'), '-Path', target],
+        { stdio: ['ignore', 'ignore', errFd] },
+      )
+    } finally {
+      if (errFd !== null) {
+        try {
+          closeSync(errFd)
+        } catch {
+          /* 已关 */
+        }
+      }
+    }
+
+    const errText = existsSync(errFile) ? readFileSync(errFile, 'utf8').trim() : ''
+
+    if (r.error || r.status !== 0) {
+      if (r.error && (r.error.code === 'EPERM' || r.error.code === 'EACCES')) {
+        envFailures.push(s.version)
+        note(`PowerShell ${s.version}: 本环境禁止启动子进程（EPERM），跳过`)
+      } else {
+        bad(`PowerShell ${s.version} 跑 write-json.ps1 失败${r.status !== null ? `（退出码 ${r.status}）` : ''}：${errText.slice(0, 300)}`)
+      }
       continue
     }
     if (!existsSync(target)) {
@@ -140,7 +219,11 @@ try {
     ok(`PowerShell ${s.version}: ${bytes.length} 字节  ${hash.slice(0, 16)}…`)
   }
 
-  if (results.length === 0) {
+  if (results.length === 0 && envFailures.length > 0) {
+    note('所有版本都因环境禁止子进程而跳过 —— 本环境无法做这项检查（不算失败）')
+  }
+
+  if (results.length === 0 && envFailures.length === 0) {
     bad('没有任何 PowerShell 成功产出，无法判定')
   } else {
     // 每个都要等于 Node 的规范形态 —— 这是"固定序列化"的定义

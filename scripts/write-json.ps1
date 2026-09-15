@@ -20,10 +20,10 @@
     stable everywhere, so the packer emits identical bytes on any machine.
 
     Usage (one file):
-        pwsh -File write-json.mjs-fixed.ps1 -Path <in.json> [-Out <out.json>]
+        pwsh -File scripts/write-json.ps1 -Path <in.json> [-Out <out.json>]
 
     Usage (several files, one call -- avoids paying Node startup per file):
-        pwsh -File write-json.mjs-fixed.ps1 -Path <a.json> -Path <b.json> ...
+        pwsh -File scripts/write-json.ps1 -Path <a.json> -Path <b.json> ...
 
     With -Out and exactly one -Path, writes there. Otherwise rewrites each -Path
     in place.

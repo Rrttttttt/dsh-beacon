@@ -35,21 +35,36 @@ const realSpawnSync = cp.spawnSync
 const realExecFileSync = cp.execFileSync
 const realExecSync = cp.execSync
 
-// execFileSync / execSync 家族：若未显式指定 stdio（即默认管道），抛 EPERM
+/**
+ * 判断一份 stdio 配置是否要用管道。
+ *
+ * ⚠️ 必须同时覆盖**三种**写法，否则注入器本身会漏：
+ *     undefined            → 默认就是 pipe
+ *     'pipe'               → 显式 pipe
+ *     ['ignore','pipe',…]  → 数组形式，**最容易被漏掉的一种**
+ *   实测踩过：早先这里只管前两种，于是 `stdio: ['ignore','pipe','ignore']` 被放行，
+ *   注入器声称"已禁止管道"、实际没禁，导致依赖它的守卫检查给出假绿。
+ */
+function usesPipe(stdio) {
+  if (stdio === undefined || stdio === 'pipe') return true
+  if (Array.isArray(stdio)) return stdio.includes('pipe')
+  return false
+}
+
+// execFileSync / execSync 家族：凡是要用管道的，一律抛 EPERM
 const guarded = (fn) => function (file, args, opts) {
-  const stdio = opts && opts.stdio
-  const usesPipe = stdio === undefined || stdio === 'pipe' || (Array.isArray(stdio) && stdio[1] === 'pipe')
-  if (usesPipe) throw EPERM()
+  if (usesPipe(opts && opts.stdio)) throw EPERM()
   return fn.apply(this, [file, args, opts])
 }
 cp.execFileSync = guarded(realExecFileSync)
 cp.execSync = guarded(realExecSync)
 
-// spawnSync：stdio 为 'inherit'/'ignore' 时放行，管道时抛 EPERM
+// spawnSync：管道配置返回 EPERM（真实环境就是这个形状：status=null + error），
+// 其余配置（'inherit' / 'ignore' / 重定向到 fd）放行。
 cp.spawnSync = function (cmd, args, opts) {
-  const stdio = opts && opts.stdio
-  const usesPipe = stdio === undefined || stdio === 'pipe'
-  if (usesPipe) return { error: EPERM(), status: null, stdout: undefined, stderr: undefined }
+  if (usesPipe(opts && opts.stdio)) {
+    return { error: EPERM(), status: null, stdout: undefined, stderr: undefined }
+  }
   return realSpawnSync.call(this, cmd, args, opts)
 }
 

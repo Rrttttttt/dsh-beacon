@@ -177,11 +177,21 @@ docs/                       说明文档
 ## 验证
 
 ```sh
-node scripts/verify-all.mjs            # 逻辑全绿
+node scripts/verify-all.mjs            # 逻辑全绿（含 selftest / simulate）
 node scripts/verify-no-lamp-logic.mjs  # 确认插件里没有灯效代码
+node scripts/audit-boundaries.mjs      # 架构边界（空闲灭灯只许在固件里等）
+node scripts/verify-no-pipe-deps.mjs   # 守卫：验证脚本不许依赖管道子进程
 powershell -File scripts/pack.ps1      # 打包
-node scripts/verify-dist.mjs           # 确认产物可用
+node scripts/verify-dist.mjs           # 确认产物可用（含 tar 头与 JSON 字节断言）
+node scripts/verify-reproducible.mjs   # 确认打包可复现（跨 PowerShell 版本字节一致）
 ```
+
+> **这些必须留在一个能开子进程的终端里跑。** `verify-reproducible.mjs` 需要启动
+> PowerShell 才能比对版本；受限沙箱里它会明确报「本环境无法运行此项检查（已跳过）」
+> 并退出 0 —— 那是**跳过**不是失败，换普通终端再跑一次才算数。
+>
+> CI 上这些都在 `.github/workflows/release.yml` 里跑，**改完验证脚本记得同步那边**——
+> 早先 `verify-reproducible.mjs` 就漏在 CI 和这份清单之外，等于没在守卫。
 
 发版：
 

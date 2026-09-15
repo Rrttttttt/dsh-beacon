@@ -11,9 +11,14 @@
  *
  *   既然要可复现，就自己钉死每一个字节：
  *     - 条目顺序：按路径排序，不依赖遍历顺序
- *     - mtime / uid / gid / uname / gname：全部固定
+ *     - tar 的 mtime / uid / gid / uname / gname：全部固定
  *     - 文件模式：固定 0644，目录 0755
- *     - gzip：固定 compression level 与 mtime=0，OS 字节固定为 255（未知）
+ *     - gzip：固定 compression level 9、OS 字节 255（未知），
+ *       MTIME 用**固定的非零值** FIXED_MTIME
+ *       （⚠️ 不能是 0：`mtime: 0` 会让 zlib 省略 MTIME 字段，而 npm 的归档解析器
+ *        要求该字段存在 —— 写 0 会导致 `npm install` 报 TAR_BAD_ARCHIVE）
+ *     - tar magic 写在**偏移 257**：写成 157（linkname 字段）会让 npm 退回
+ *       GNU tar 语义、把空 linkname 判成 "linkpath forbidden" 而拒绝整包
  *     - 格式：ustar 前缀写法（路径 >100 字符时自动用 prefix 字段）
  *
  * 产出 npm 期望的结构：所有内容放在 `package/` 前缀下。
