@@ -88,9 +88,9 @@ Error: ERR_PNPM_CONFIG_SET_UNSUPPORTED_YAML_CONFIG_KEY
 `file:` 只复制 `package.json` 的 `files` 白名单，**丢掉 `node_modules`**；
 `link:` 建 junction，自带依赖树原样保留。
 
-### 顺带：为什么路径含空格要自动换位置
+### 顺带：为什么路径含空格要换位置，以及为什么每个 profile 各存一份
 
-`dsh plugin` 用 `shell: true` 转发给 pnpm，Windows 下**参数引号会丢**：
+**路径含空格**：`dsh plugin` 用 `shell: true` 转发给 pnpm，Windows 下**参数引号会丢**：
 
 ```
 link:D:\Agent Workstation\...\plugin
@@ -102,8 +102,13 @@ link:D:\Agent Workstation\...\plugin
 DSH 自己的 `anchorPathSpec()` 不解决这个 —— 它只重写 `.` / `..` 开头的相对路径。
 Windows 8.3 短名本是干净解法，但该卷上常常是关闭的（本机实测关闭）。
 
-所以 `install-dist.ps1` 检测到路径含空格时，会先 `robocopy` 整个插件目录
-（**含 `node_modules`**）到 `~/.dsh/plugins/dsh-led-bridge`，再从那里 `link:`。
+**每个 profile 各存一份**：`install.ps1` 把插件暂存到
+`$DSH_HOME\plugins\<插件名>-<profile>\`，**不是**一个所有 profile 共用的目录。
+
+原因是共用会造成静默破坏：装第二个 profile（比如测试用的）会**替换掉第一个
+profile 正在用的插件**。这个坑在开发这个安装脚本时真实踩到了，还得手工修回来。
+每个 profile 各一份之后，`-Profile web` 和 `-Profile scratch` 互不影响，
+卸载也只是删个目录。
 
 ---
 
@@ -193,6 +198,20 @@ npm publish --access public
 ## 六、事故记录（都是真实发布出去过、或差点发布出去的）
 
 记在这里是为了**别重犯**，尤其是那些"表面成功、实际坏掉"的类型。
+
+### v0.2.0 / v0.2.1 的安装脚本会覆盖别的 profile（v0.2.2 已修）
+
+**症状**：往一个测试 profile 里装插件，**正在使用的正式 profile 的插件被替换了**。
+
+**根因**：安装脚本把所有 profile 都暂存到同一个共享目录
+`~/.dsh/plugins/dsh-led-bridge`。装第二个 profile 时它先删除该目录再重建，
+于是一个 profile 的安装静默破坏了另一个 profile 的安装。
+
+**修法**：改成每个 profile 各存一份 —— `$DSH_HOME\plugins\<插件名>-<profile>\`。
+验证方式是两个 profile 各装一次，然后断言两者的符号链接**指向不同路径**。
+
+**教训**：安装脚本会写用户机器上的**全局**位置时，必须想清楚"再装一次"会不会
+破坏已有安装。共享路径 + 先删后建 = 静默破坏。
 
 ### v0.2.0 的 tarball 是坏的：装得上，但跑不起来
 

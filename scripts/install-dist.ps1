@@ -151,9 +151,20 @@ Write-Ok "pnpm : $($pnpm.Source) ($(& pnpm --version))"
 # ---------------------------------------------------------------------------
 # 4. Work out $DSH_HOME and the profile directory
 # ---------------------------------------------------------------------------
+# DSH_HOME resolution mirrors what `dsh` itself does: DSH_HOME wins, otherwise
+# ~/.dsh. Profiles live at $DSH_HOME/profiles/<name>.
 $dshHome = if ($env:DSH_HOME) { $env:DSH_HOME } else { Join-Path $env:USERPROFILE '.dsh' }
 $profileDir  = Join-Path $dshHome "profiles\$Profile"
 $profileJson = Join-Path $profileDir 'package.json'
+
+# Per-profile install location, deliberately NOT a single shared folder.
+#
+# Why: a shared location means installing into a second profile (a test profile,
+# say) SILENTLY REPLACES the plugin the first profile is using. That happened
+# while testing this installer and had to be repaired by hand. Giving each
+# profile its own copy makes `-Profile web` and `-Profile scratch` independent,
+# and makes uninstalling one profile's plugin a plain folder delete.
+$safeRoot = Join-Path $dshHome "plugins\$pluginName-$Profile"
 
 Write-Step 'Resolving the DSH profile'
 Write-Host "    DSH_HOME: $dshHome"
@@ -175,51 +186,53 @@ if (Test-Path -LiteralPath $profileJson) {
 }
 
 # ---------------------------------------------------------------------------
-# 5. Copy to a space-free location when necessary
+# 5. Stage the plugin at its install location
 # ---------------------------------------------------------------------------
-$installPath = $pluginPath
+Write-Step 'Staging the plugin'
 
 if ($pluginPath -match ' ') {
-    Write-Step 'Path contains a space; copying to a space-free location'
+    Write-Host "    source path contains a space; copying to a space-free location"
     Write-Host "    from: $pluginPath"
-
-    $safeRoot = Join-Path $dshHome "plugins\$pluginName"
     Write-Host "    to  : $safeRoot"
+} else {
+    Write-Host "    source path is space-free, but staging anyway so every profile"
+    Write-Host "    gets its own copy (a shared folder would let one profile's"
+    Write-Host "    install silently replace another's)"
+    Write-Host "    from: $pluginPath"
+    Write-Host "    to  : $safeRoot"
+}
 
-    if (Test-Path -LiteralPath $safeRoot) {
-        # Delete first. If we merely merged, a previous pnpm-layout node_modules
-        # would sit alongside the vendored tree and break resolution.
-        Write-Host '    removing the previous install at that location...'
-        Get-ChildItem -LiteralPath $safeRoot -Recurse -Force -ErrorAction SilentlyContinue |
-            ForEach-Object {
-                # Do not follow junctions; clear the link itself.
-                if ($_.LinkType) { try { $_.Delete() } catch { } }
-                else { try { $_.Attributes = 'Normal' } catch { } }
-            }
-        Remove-Item -LiteralPath $safeRoot -Recurse -Force -ErrorAction SilentlyContinue
-        if (Test-Path -LiteralPath $safeRoot) {
-            Die "Could not remove the existing $safeRoot." @(
-                'Close any Explorer window or editor sitting in that folder, then retry.'
-            )
+if (Test-Path -LiteralPath $safeRoot) {
+    # Delete first. If we merely merged, a previous pnpm-layout node_modules
+    # would sit alongside the vendored tree and break resolution.
+    Write-Host '    removing the previous install at that location...'
+    Get-ChildItem -LiteralPath $safeRoot -Recurse -Force -ErrorAction SilentlyContinue |
+        ForEach-Object {
+            # Do not follow junctions; clear the link itself.
+            if ($_.LinkType) { try { $_.Delete() } catch { } }
+            else { try { $_.Attributes = 'Normal' } catch { } }
         }
-    }
-
-    New-Item -ItemType Directory -Force -Path $safeRoot | Out-Null
-    # /E copies subdirectories including empty ones. node_modules IS copied --
-    # that is the entire point of this shape.
-    & robocopy $pluginPath $safeRoot /E /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { Die "robocopy failed with exit code $LASTEXITCODE" }
-
-    if (-not (Test-Path -LiteralPath (Join-Path $safeRoot 'node_modules\serialport'))) {
-        Die 'The copy is missing node_modules\serialport.' @(
-            'Antivirus software may have blocked the copy. Try again, or copy manually.'
+    Remove-Item -LiteralPath $safeRoot -Recurse -Force -ErrorAction SilentlyContinue
+    if (Test-Path -LiteralPath $safeRoot) {
+        Die "Could not remove the existing $safeRoot." @(
+            'Close any Explorer window or editor sitting in that folder, then retry.'
         )
     }
-    Write-Ok 'copied (including node_modules)'
-    $installPath = $safeRoot
-} else {
-    Write-Ok 'plugin path is already space-free; installing in place'
 }
+
+New-Item -ItemType Directory -Force -Path $safeRoot | Out-Null
+# /E copies subdirectories including empty ones. node_modules IS copied --
+# that is the entire point of this shape.
+& robocopy $pluginPath $safeRoot /E /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -ge 8) { Die "robocopy failed with exit code $LASTEXITCODE" }
+
+if (-not (Test-Path -LiteralPath (Join-Path $safeRoot 'node_modules\serialport'))) {
+    Die 'The staged copy is missing node_modules\serialport.' @(
+        'Antivirus software may have blocked the copy. Try again, or copy manually.'
+    )
+}
+Write-Ok "staged at $safeRoot (including node_modules)"
+$installPath = $safeRoot
 
 # ---------------------------------------------------------------------------
 # 6. Register the plugin with DSH
