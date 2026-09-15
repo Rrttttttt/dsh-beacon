@@ -199,6 +199,67 @@ npm publish --access public
 
 记在这里是为了**别重犯**，尤其是那些"表面成功、实际坏掉"的类型。
 
+### v0.2.4：打包**不可复现** —— 下载的包没法核对
+
+**症状**：同一个 commit，`powershell -File scripts/pack.ps1`（README 教用户跑的）
+与 CI 的 `shell: pwsh` 产出**不同字节**的 zip / tgz，于是发布包的 SHA256
+在本地复现不出来。想核对下载包的人会以为包被污染。
+
+**根因**：打包链路上有两个「随 PowerShell 版本变字节」的坑，**都测过**：
+
+| | PS 5.1 | PS 7 |
+|---|---|---|
+| `ConvertTo-Json` | 4 空格缩进、冒号后**两个**空格、`>` 转义成 `\u003e` | 2 空格、`>` 原样 |
+| 同一对象体积 | 327 字节 | 208 字节 |
+| `Compress-Archive` | zip 元数据不同 | zip 元数据不同 |
+
+`Compress-Archive` 那个更难发现：**解压后 202 个文件内容全部相同**，
+只有整包 SHA256 不同。而 `verify-dist.mjs` 当时断言的是**字段**不是**字节**，
+所以本地 47/47、CI 也 47/47 —— 两边都绿，哈希却不一样。
+
+**修法**：
+
+1. 新增 `scripts/write-json.ps1`：把 `ConvertTo-Json` 的结果统一过一遍
+   Node 的 `JSON.stringify(v, null, 2)`。`pack.ps1` 的三处序列化全部改走它。
+2. 新增 `scripts/_zip.mjs`：自己写确定性 zip —— 钉死时间戳、条目顺序（按路径排序）、
+   权限位、压缩等级，不写 extra field。`pack.ps1` 不再用 `Compress-Archive`。
+3. `verify-dist.mjs` 新增 `[4b]`：对**打包器自己改写的那两个 package.json**
+   断言**确切字节**（不是字段）。只点名这两个，不遍历全树 —— 依赖树里有手工排版的
+   文件（`node-addon-api/package-support.json` 是紧凑数组，467 字节 vs 规范 500 字节），
+   对第三方文件的排版提要求是错的。
+4. 新增 `scripts/verify-reproducible.mjs`：盘点本机所有 PowerShell，各跑一次
+   `write-json.ps1`，断言产出的字节**完全相同**且等于 Node 规范形态；
+   同时断言打包脚本不再直接用 `Compress-Archive` 产出 zip。
+
+**结果**：实测 PS 5.1 与 PS 7.6.6 打出的 zip / tgz **SHA256 完全一致**。
+
+> 教训：**"内容正确"不等于"字节可复现"。** 行尾（`.gitattributes`）和 JSON
+> 序列化是同一类坑的两个面 —— 前一个早踩过并留了注释，后一个漏了。
+> 判据要盯字节，因为用户核对的就是字节。
+
+### v0.2.4：README 教人走一条必然失败的路
+
+**症状**：README「方式二：npm 包」让人跑
+`dsh plugin --profile web add dsh-led-bridge`，但该包**从未发布到 npm**
+（实测 `registry.npmjs.org/dsh-led-bridge` → 404）。照做直接失败，且不知道原因。
+
+**修法**：方式二标题直接标**「尚未发布，现在跑必然失败」**，并说明要走这条路得先由作者
+`npm publish`。同时 `dsh-beacon` 这个 npm 名已被他人占用（`dushaobindoudou`，0.0.1），
+README 里列出实测可用的备选名 —— 因为改名会牵连包名、Release 文件名、
+workflow artifact 名、安装目录名、以及用户 profile 里已登记的 id，越早定越便宜。
+
+### v0.2.4：清理
+
+- `scripts/compare-plugins.mjs` 删除。它比对 bridge 与**旧版 beacon** 的命令流，
+  而那个"不一致"正是**设计上的有意变更**（`busy` 状态 → 独立的 `tools on` 命令），
+  于是它永远报"不一致"；还依赖工程外的绝对路径、无人引用。属于另一个项目的验收工具，
+  不属于本仓库。
+- `simulate.mjs` / `compare-plugins.mjs` 里残留的 `idleTimeoutMs: 0` 清掉 ——
+  插件已无此键，留着会让读代码的人以为它还在（`verify-no-lamp-logic.mjs` 只扫
+  `plugin/` 源码，扫不到测试脚本）。
+- 测试脚本、workflow 注释、README 里的**死版本号**（`v0.2.2` / `v0.2.0`）
+  改成 `v<版本>` 占位。
+
 ### v0.2.3 修掉的一批（由一次外部审查发现）
 
 #### 1. 验证脚本在受限环境给出**假失败**

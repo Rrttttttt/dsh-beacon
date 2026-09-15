@@ -160,11 +160,18 @@ if ($SkipInstall) {
     Write-Host "    dependencies to vendor: $($depNames -join ', ')"
 
     $srcManifest.PSObject.Properties.Remove('dsh')
+    # Serialize with write-json.ps1, NOT ConvertTo-Json: the latter is not
+    # byte-stable across PowerShell versions (PS 5.1 uses 4-space indent and
+    # escapes ">" as \u003e; PS 7 uses 2-space indent), which would make the
+    # published artifact's SHA256 unreproducible between a local run and CI.
+    $stageManifest = Join-Path $stage 'package.json'
     [System.IO.File]::WriteAllText(
-        (Join-Path $stage 'package.json'),
+        $stageManifest,
         ($srcManifest | ConvertTo-Json -Depth 30),
         (New-Object System.Text.UTF8Encoding($false))
     )
+    & (Join-Path $PSScriptRoot 'write-json.ps1') -Path $stageManifest
+    if ($LASTEXITCODE -ne 0) { throw "write-json.ps1 failed on $stageManifest" }
 
     Push-Location $stage
     try {
@@ -213,6 +220,10 @@ if ($vp.PSObject.Properties.Name -contains 'dependencies') {
     $dropped = @($vp.dependencies.PSObject.Properties.Name)
     $vp.PSObject.Properties.Remove('dependencies')
     [System.IO.File]::WriteAllText($vendorPkgPath, ($vp | ConvertTo-Json -Depth 30), (New-Object System.Text.UTF8Encoding($false)))
+    # Fixed serializer again: ConvertTo-Json alone is version-dependent, which
+    # would make the zip's bytes (and SHA256) differ between local and CI.
+    & (Join-Path $PSScriptRoot 'write-json.ps1') -Path $vendorPkgPath
+    if ($LASTEXITCODE -ne 0) { throw "write-json.ps1 failed on $vendorPkgPath" }
     Write-Ok "shipped manifest no longer declares: $($dropped -join ', ')"
 } else {
     Write-Ok 'shipped manifest already has no dependencies'
@@ -237,6 +248,10 @@ if (Test-Path -LiteralPath $bcPkgPath) {
     }
     $json = $bc | ConvertTo-Json -Depth 30
     [System.IO.File]::WriteAllText($bcPkgPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+    # Fixed serializer: this file lands in the zip, so its bytes must be identical
+    # on every machine or the artifact's SHA256 cannot be reproduced.
+    & (Join-Path $PSScriptRoot 'write-json.ps1') -Path $bcPkgPath
+    if ($LASTEXITCODE -ne 0) { throw "write-json.ps1 failed on $bcPkgPath" }
     Write-Ok "stripped (gypfile present: $hadGypfile, scripts present: $hadScripts)"
 } else {
     Write-Warn 'bindings-cpp not found; skipped (serialport may have changed layout)'
@@ -384,10 +399,28 @@ $zipName = "$($pkg.name)-$version.zip"
 $zipPath = Join-Path $distRoot $zipName
 if (Test-Path -LiteralPath $zipPath) { Remove-Item -LiteralPath $zipPath -Force }
 
-# Compress-Archive on the FOLDER, so the zip contains a top-level
-# "dsh-led-bridge\" directory. Extracting anywhere (including paths with spaces)
-# then yields a folder whose install.ps1 can be run directly.
-Compress-Archive -LiteralPath $pkgDir -DestinationPath $zipPath -CompressionLevel Optimal
+# Stage the folder under its OWN name first, so the zip's top level is
+# "dsh-led-bridge/..." -- extracting anywhere then yields a folder whose
+# install.ps1 can be run directly.
+#
+# Why not Compress-Archive: it writes DIFFERENT BYTES on PS 5.1 vs PS 7, so the
+# zip produced by `powershell -File scripts/pack.ps1` (what README tells users to
+# run) would not match the one CI builds from the same commit -- and anyone
+# verifying a download against SHA256SUMS.txt would think it was tampered with.
+# scripts/_zip.mjs pins timestamps, entry order, permissions and compression.
+$zipStage = Join-Path $distRoot '_zip-stage'
+if (Test-Path -LiteralPath $zipStage) { Remove-Item -LiteralPath $zipStage -Recurse -Force }
+New-Item -ItemType Directory -Force -Path (Join-Path $zipStage $pkg.name) | Out-Null
+& robocopy $pkgDir (Join-Path $zipStage $pkg.name) /E /NFL /NDL /NJH /NJS /NP | Out-Null
+if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE while staging the zip" }
+
+$node = (Get-Command node -ErrorAction SilentlyContinue)
+if (-not $node) { throw 'node not found on PATH. The packer needs it for byte-stable zip output.' }
+& node (Join-Path $PSScriptRoot '_zip.mjs') $zipStage $zipPath
+if ($LASTEXITCODE -ne 0) { throw "_zip.mjs failed with exit code $LASTEXITCODE" }
+Remove-Item -LiteralPath $zipStage -Recurse -Force -ErrorAction SilentlyContinue
+
+if (-not (Test-Path -LiteralPath $zipPath)) { throw "zip was not produced at $zipPath" }
 Write-Ok "zip: $zipName"
 
 # ---------------------------------------------------------------------------

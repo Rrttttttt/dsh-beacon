@@ -15,6 +15,30 @@
 >
 > bridge 会**成为 beacon 的一个输出通道（sink）**，到那时才谈得上改名。
 > 在那之前，本 README、`plugin/README.md`、`docs/` 说的都是 bridge。
+>
+> ### ⚠️ 但 `dsh-beacon` 这个 **npm 包名已经被别人拿走了**
+>
+> 实测 `registry.npmjs.org/dsh-beacon` 返回 200，占用者 `dushaobindoudou`，
+> 版本 `0.0.1`，描述写着 "name reserved"（2026-09-10 注册）。
+> **将来 beacon 真要发布时，这个名字拿不到。**
+>
+> 而改名会牵连一串东西：包名、Release 文件名、workflow artifact 名、
+> 安装目录名（`~/.dsh/plugins/<包名>-<profile>`）、以及用户 profile 里已登记的 id。
+> **越早定越便宜。**
+>
+> 实测**可用**的备选（2026-09-15 查询）：
+>
+> | 备选名 | npm 状态 |
+> |---|---|
+> | `dsh-beacon-widget` | ✅ 可用 |
+> | `dsh-status-beacon` | ✅ 可用 |
+> | `dsh-signal-beacon` | ✅ 可用 |
+> | `deepseek-harness-beacon` | ✅ 可用 |
+> | `dsh-lantern` | ✅ 可用 |
+> | `dsh-status-light` | ✅ 可用 |
+>
+> 或者用 **scoped 名**（`@你的用户名/dsh-beacon`）—— scoped 命名空间归账号所有，
+> 不会被抢。要占位就现在发一个 `0.0.1`（`npm publish --access public`）。
 
 ---
 
@@ -63,13 +87,19 @@ powershell -ExecutionPolicy Bypass -File .\dsh-led-bridge\install.ps1
 把插件放到 `~/.dsh/plugins/`（路径含空格时会自动换位置）、
 `dsh plugin add` 注册进 profile、然后验证插件层是否真的生效。
 
-### 方式二：npm 包
+### 方式二：npm 包 —— ⚠️ **尚未发布，现在跑必然失败**
+
+> **`dsh-led-bridge` 还没有发布到 npm**（实测 `registry.npmjs.org/dsh-led-bridge` 返回 404）。
+> 下面这条命令**现在会直接报 404**。要用这条路，得先由作者按
+> [docs/DISTRIBUTION.md](./docs/DISTRIBUTION.md) 第四节手工 `npm publish` 一次。
+> 在那之前请走**方式一**（自包含包）或**方式三**（源码）。
 
 ```sh
+# 仅当包已发布到 npm 之后才可用
 dsh plugin --profile web add dsh-led-bridge
 ```
 
-> ⚠️ **这种方式需要手工加一项配置。** 插件的依赖 `serialport` 会拉下
+> ⚠️ **即使包已发布，这种方式也需要手工加一项配置。** 插件的依赖 `serialport` 会拉下
 > `@serialport/bindings-cpp`，它带 install 脚本；pnpm ≥ 10 默认拦截构建脚本并
 > **以退出码 1 结束**，而 `dsh plugin` 只在退出码为 0 时才登记插件 ——
 > 结果是包进了 `dependencies`，却**永远不进 `dsh.profile.bundles`**，
@@ -159,8 +189,8 @@ node scripts/verify-dist.mjs           # 确认产物可用
 # 1. 改 plugin/package.json 的 version
 # 2. 本地验证全绿
 # 3. 打标签推送，GitHub Actions 会自动构建并创建 Release
-git tag v0.2.2
-git push origin v0.2.2
+git tag v<版本>          # 例如 v0.2.4
+git push origin v<版本>
 ```
 
 ---

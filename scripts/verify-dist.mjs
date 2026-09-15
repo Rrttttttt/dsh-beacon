@@ -156,6 +156,53 @@ check(
 )
 
 // ---------------------------------------------------------------------------
+console.log('\n[4b] 产物里的 JSON 必须是「固定序列化」的字节')
+// ---------------------------------------------------------------------------
+// 为什么断言**字节**而不只是字段：
+//   `ConvertTo-Json` 的输出随 PowerShell 版本变（PS 5.1 用 4 空格缩进、
+//   冒号后两个空格、把 ">" 转义成 \u003e；PS 7 用 2 空格）。内容等价，
+//   **字节不同** —— 于是本地打包与 CI 打包的 SHA256 对不上，想核对下载包的人
+//   会以为包被污染。
+//   只断言字段的话查不出这个问题（本地 47/47、CI 也 47/47，但两者哈希不同）。
+//
+// 规范形态 = Node 的 JSON.stringify(value, null, 2) + 末尾换行 —— 正是
+// scripts/write-json.ps1 产出、scripts/verify-reproducible.mjs 跨版本验证过的东西。
+//
+// 只盯 pack.ps1 **自己改写**的那两个文件，不遍历所有 JSON：
+// 依赖树里有些文件本来就**不是**规范排版，例如 node-addon-api 的
+// package-support.json 是手工格式化过的（数组元素紧凑排列，467 字节 vs 规范化的
+// 500 字节）。对第三方文件的排版提要求是错的，所以逐个点名而不是全扫。
+const GENERATED_JSON = [
+  join(VENDOR, 'package.json'),
+  join(VENDOR, 'node_modules', '@serialport', 'bindings-cpp', 'package.json'),
+]
+
+for (const p of GENERATED_JSON) {
+  const label = p.replace(VENDOR + '\\', 'plugin\\').replace(VENDOR + '/', 'plugin/')
+  if (!existsSync(p)) {
+    bad(`${label} 不存在（打包器本该改写它）`)
+    continue
+  }
+  const text = readFileSync(p, 'utf8')
+  let canonical
+  try {
+    canonical = JSON.stringify(JSON.parse(text), null, 2) + '\n'
+  } catch (e) {
+    bad(`${label} 不是合法 JSON：${e.message}`)
+    continue
+  }
+  const why =
+    text === canonical
+      ? ''
+      : /\n {4}"/.test(text)
+        ? '4 空格缩进（PS 5.1 的 ConvertTo-Json 形态）'
+        : text.includes('\\u003e')
+          ? '含 \\u003e 转义（PS 5.1 的 ConvertTo-Json 形态）'
+          : '与规范形态不同'
+  check(`${label} 是固定序列化字节（跨 PowerShell 版本可复现）`, why === '', why || `${text.length} 字节`)
+}
+
+// ---------------------------------------------------------------------------
 console.log('\n[5] zip 内容')
 // ---------------------------------------------------------------------------
 if (existsSync(ZIP)) {

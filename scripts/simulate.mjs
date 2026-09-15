@@ -66,7 +66,7 @@ function createHarness(overrides = {}) {
   // 直接构造真实 StateMachine（它就是 apply 内部用的那个类），
   // 并把 transport 换成假的。这样测的仍是生产逻辑。
   const { StateMachine } = __testing
-  const cfg = { alarmTimeoutMs: 0, idleTimeoutMs: 0, ...overrides }
+  const cfg = { alarmTimeoutMs: 0, ...overrides }
   const machine = new StateMachine(cfg, transport, () => {})
 
   // 同时验证 apply 真的注册了监听（证明插件整体接线没问题）

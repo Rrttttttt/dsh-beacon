@@ -9,7 +9,7 @@ name: Build release artifacts
 # 发版流程：
 #   1. 改 plugin/package.json 的 version
 #   2. node scripts/verify-all.mjs          （本地先确认全绿）
-#   3. git tag v0.2.0 && git push origin v0.2.0
+#   3. git tag v<版本> && git push origin v<版本>      例如 v0.2.4
 #   4. 本 workflow 自动构建、验证、创建 Release 并附上 zip / tgz
 #
 # 关于 npm 发布：
