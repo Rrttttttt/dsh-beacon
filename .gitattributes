@@ -1,0 +1,48 @@
+# ============================================================================
+# 统一行尾为 LF
+# ============================================================================
+#
+# 为什么需要这个文件：
+#
+# Windows 上 git 默认 core.autocrlf=true，检出时把仓库里的 LF 转成 CRLF。
+# 本仓库的源码是 LF，于是同一个文件在不同机器上会有**不同的字节**：
+#
+#     CI 检出（GitHub runner, autocrlf 关）: LF  → lib/index.js 35964 字节
+#     本地检出（Windows, autocrlf=true）   : CRLF → lib/index.js 36912 字节
+#
+# 后果不是功能问题（Node 两种都读得懂），而是**没法用哈希核对**：
+# 我一度因此以为发布包被污染，花时间排查；别人也一样会踩。
+# 它还会让"本地打包 == CI 打包"这个有用的断言永远为假。
+#
+# 所以在这里显式钉死 LF：让每种平台检出的字节都一致。
+# ============================================================================
+
+# 默认：文本文件一律 LF
+* text=auto eol=lf
+
+# 明确按文本处理并强制 LF 的类型
+*.js    text eol=lf
+*.mjs   text eol=lf
+*.json  text eol=lf
+*.yml   text eol=lf
+*.yaml  text eol=lf
+*.md    text eol=lf
+*.ino   text eol=lf
+*.ps1   text eol=lf
+*.c     text eol=lf
+*.h     text eol=lf
+*.csv   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+
+# 二进制：绝不转换
+*.pdf   binary
+*.png   binary
+*.jpg   binary
+*.gif   binary
+*.zip   binary
+*.tgz   binary
+*.bin   binary
+*.node  binary
+*.mp3   binary
+*.wav   binary

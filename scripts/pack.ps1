@@ -57,10 +57,7 @@
 [CmdletBinding()]
 param(
     # Reuse dist/.../plugin/node_modules instead of reinstalling.
-    [switch]$SkipInstall,
-    # Emit the tarball WITH the serialport dependency declared (for npm publish).
-    # Default is dependency-free, which is what the self-contained shape wants.
-    [switch]$TarballWithDeps
+    [switch]$SkipInstall
 )
 
 $ErrorActionPreference = 'Stop'
@@ -320,27 +317,46 @@ Write-Ok 'LICENSE'
 # ---------------------------------------------------------------------------
 Write-Step "Building the tarball ($tgzName)"
 
-# Shape A wants NO dependencies (so the target needs no allowBuilds). The public
-# npm tarball needs serialport DECLARED, otherwise a tarball-only install has no
-# way to obtain the serial binding at all.
-$tarballDeps = $null
-if ($TarballWithDeps) {
-    $tarballSrc = Join-Path $distRoot '_tarball-src'
-    & robocopy $vendorDir $tarballSrc /E /XD node_modules /NFL /NDL /NJH /NJS /NP | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy failed with exit code $LASTEXITCODE" }
+# The two shapes are OPPOSITE on purpose, and getting this backwards ships a
+# broken package. This was a real bug in v0.2.0:
+#
+#   Shape A (folder/zip) -- NO dependencies declared. The vendored node_modules
+#     next to it IS the dependency. Declaring them would make pnpm try to fetch
+#     and build, which is exactly the allowBuilds trap we are avoiding.
+#
+#   Shape B (tarball) -- dependencies DECLARED. `pnpm pack` always excludes
+#     node_modules, so the tarball has no vendored tree; the only way it can get
+#     serialport is to declare it. If a tarball declares nothing AND carries
+#     nothing, `dsh plugin add` succeeds but the plugin then fails to import
+#     serialport at runtime -- it degrades to "serialport not installed, serial
+#     unavailable" and the lamp never moves. The install LOOKS fine, which is
+#     what makes it dangerous.
+#
+# So the tarball is packed from its own staging copy, built from the SOURCE
+# manifest (which still declares serialport) rather than from the stripped
+# vendored copy.
+$tarballSrc = Join-Path $distRoot '_tarball-src'
+if (Test-Path -LiteralPath $tarballSrc) { Remove-Item -LiteralPath $tarballSrc -Recurse -Force }
+New-Item -ItemType Directory -Force -Path $tarballSrc | Out-Null
 
-    $tPkgPath = Join-Path $tarballSrc 'package.json'
-    $tPkg = Get-Content -LiteralPath $tPkgPath -Raw | ConvertFrom-Json
-    $tPkg | Add-Member -NotePropertyName dependencies -NotePropertyValue ([pscustomobject]@{ serialport = '^13.0.0' }) -Force
-    [System.IO.File]::WriteAllText($tPkgPath, ($tPkg | ConvertTo-Json -Depth 30), (New-Object System.Text.UTF8Encoding($false)))
-    $tarballDeps = $tarballSrc
-    Write-Ok 'tarball source prepared WITH dependencies (serialport ^13.0.0)'
-} else {
-    $tarballDeps = $vendorDir
-    Write-Ok 'tarball source has NO dependencies (installs with zero configuration)'
+# Copy the source files (lib, cordis.patch.yml, README, LICENSE) but never
+# node_modules -- and never the stripped manifest.
+foreach ($item in @('lib', 'cordis.patch.yml', 'README.md', 'LICENSE')) {
+    $from = Join-Path $pluginSrc $item
+    if (Test-Path -LiteralPath $from) {
+        Copy-Item -LiteralPath $from -Destination $tarballSrc -Recurse -Force
+    }
 }
+# The manifest must be the SOURCE one, which declares serialport.
+Copy-Item -LiteralPath (Join-Path $pluginSrc 'package.json') -Destination (Join-Path $tarballSrc 'package.json') -Force
 
-Push-Location $tarballDeps
+$tPkg = Get-Content -LiteralPath (Join-Path $tarballSrc 'package.json') -Raw | ConvertFrom-Json
+if (-not $tPkg.dependencies -or -not $tPkg.dependencies.serialport) {
+    throw 'The tarball staging manifest has no serialport dependency. A tarball without it cannot work (pnpm pack drops node_modules).'
+}
+Write-Ok "tarball declares dependencies: $((@($tPkg.dependencies.PSObject.Properties.Name)) -join ', ')"
+
+Push-Location $tarballSrc
 try {
     & pnpm pack --pack-destination $distRoot 2>&1 | Out-Null
     if ($LASTEXITCODE -ne 0) { throw "pnpm pack failed with exit code $LASTEXITCODE" }
@@ -356,10 +372,8 @@ if (-not (Test-Path -LiteralPath $producedTgz)) {
 }
 Write-Ok "tarball: $tgzName"
 
-# The staging copy is an implementation detail; keep dist/ clean.
-if ($TarballWithDeps) {
-    Remove-Item -LiteralPath (Join-Path $distRoot '_tarball-src') -Recurse -Force -ErrorAction SilentlyContinue
-}
+# Staging is an implementation detail; keep dist/ clean.
+Remove-Item -LiteralPath $tarballSrc -Recurse -Force -ErrorAction SilentlyContinue
 
 # ---------------------------------------------------------------------------
 # 9. Shape A (continued): the zip

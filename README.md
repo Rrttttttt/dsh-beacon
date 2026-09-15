@@ -142,8 +142,8 @@ node scripts/verify-dist.mjs           # 确认产物可用
 # 1. 改 plugin/package.json 的 version
 # 2. 本地验证全绿
 # 3. 打标签推送，GitHub Actions 会自动构建并创建 Release
-git tag v0.2.0
-git push origin v0.2.0
+git tag v0.2.1
+git push origin v0.2.1
 ```
 
 ---

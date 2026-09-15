@@ -215,6 +215,34 @@ if (existsSync(TGZ)) {
       'tgz 不含 node_modules（pnpm pack 永远排除，故 tgz 装不了自带依赖）',
       !entries.some((e) => e.includes('node_modules')),
     )
+
+    // ---- 关键断言：tarball 必须声明依赖 ----
+    //
+    // 这是 v0.2.0 真实发布过的 bug：tarball 从"剥掉 dependencies 的 vendor 副本"
+    // 打包，于是它既带不了 node_modules（pnpm pack 永远排除）、又没声明依赖，
+    // 结果 `dsh plugin add` 成功、插件却解析不到 serialport，
+    // 运行时静默降级成"串口不可用" —— 安装看起来完全正常。
+    //
+    // 两种形态在这一点上是相反的，必须分别断言：
+    //   自包含目录 → 无 dependencies（依赖树就在旁边，声明了反而触发 allowBuilds）
+    //   tarball   → 有 dependencies（没有依赖树，只能靠声明去拉）
+    try {
+      const extracted = execFileSync('tar', ['-xzOf', TGZ, 'package/package.json'], { encoding: 'utf8' })
+      const tgzPkg = JSON.parse(extracted)
+      check(
+        'tgz 声明了 serialport 依赖（否则装了也解析不到原生绑定）',
+        tgzPkg.dependencies?.serialport !== undefined,
+        tgzPkg.dependencies ? JSON.stringify(tgzPkg.dependencies) : '没有 dependencies 字段',
+      )
+      check(
+        'tgz 的包名与自包含目录一致',
+        tgzPkg.name === vendorPkg.name,
+        `${tgzPkg.name} vs ${vendorPkg.name}`,
+      )
+      check('tgz 的版本与自包含目录一致', tgzPkg.version === vendorPkg.version, `${tgzPkg.version} vs ${vendorPkg.version}`)
+    } catch (e) {
+      bad('无法读取 tgz 内的 package.json', e.message)
+    }
   }
 } else {
   bad('tgz 不存在，跳过')

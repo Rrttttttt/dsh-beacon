@@ -9,7 +9,11 @@
 | 用户命令 | 解压 → `install.ps1` | `dsh plugin --profile web add dsh-led-bridge` |
 | **需要改配置吗** | **不需要** | **需要加一项 `allowBuilds`** |
 | 运行时依赖 | 随包自带（2.7 MB） | 安装时从 registry 拉 |
-| 包体积 | 1.07 MB（压缩后） | 18.6 KB |
+| 包体积 | 1.07 MB（压缩后） | 19.6 KB |
+| `package.json` 里的 `dependencies` | **无**（依赖树就在旁边） | **有 `serialport`**（没有依赖树，只能靠声明去拉） |
+
+> ⚠️ **两种形态在 `dependencies` 上是相反的，别搞混。**
+> 详见第七节的事故记录 —— 弄反会发出一个"装得上但跑不起来"的包。
 
 ---
 
@@ -31,7 +35,7 @@ pnpm ≥ 10 默认**不执行依赖的构建脚本**，并且**以退出码 1 �
 
 | 实验 | 做法 | 结果 |
 |---|---|---|
-| 1 | 干净 profile + `dsh plugin add <tgz>` | pnpm 退出 1（`ERR_PNPM_IGNORED_BUILDS`）。包**进了 `dependencies`，却没进 `dsh.profile.bundles`** |
+| 1 | 干净 profile + `dsh plugin add <tgz>`（声明了依赖） | pnpm 退出 1（`ERR_PNPM_IGNORED_BUILDS`）。包**进了 `dependencies`，却没进 `dsh.profile.bundles`** |
 | 2 | 把 profile 里 `allowBuilds` 占位改成 `true` 后重跑 | pnpm 退出 0 → ✅ 登记成功，`serialport` 加载正常 |
 | 3 | `pnpm config set allowBuilds … --global` | **被 pnpm 拒绝**：`ERR_PNPM_CONFIG_SET_UNSUPPORTED_YAML_CONFIG_KEY` |
 | 4 | 插件**不声明 `dependencies`** + 自带依赖树 | pnpm 退出 **0（65 ms）** → ✅ 登记成功，profile 里**完全没有 `allowBuilds`** |
@@ -183,3 +187,51 @@ npm publish --access public
 2. 用户侧：从源码安装时的构建授权"不在 agent 运行的任何沙箱之内"，
    只该对信任的来源授权。
 3. 本插件的依赖只有 `serialport` 一个（成熟库），没有其他传递依赖风险来源。
+
+---
+
+## 六、事故记录（都是真实发布出去过、或差点发布出去的）
+
+记在这里是为了**别重犯**，尤其是那些"表面成功、实际坏掉"的类型。
+
+### v0.2.0 的 tarball 是坏的：装得上，但跑不起来
+
+**症状**：`dsh plugin add dsh-led-bridge-0.2.0.tgz` 退出码 0、插件进了
+`dsh.profile.bundles`，看起来一切正常。但插件运行时**解析不到 `serialport`**，
+于是静默降级成「未安装 serialport 依赖，无法使用串口」——**灯永远不动**。
+
+**根因**：打包脚本让 tarball 也从**剥掉 `dependencies` 的 vendor 副本**打包。
+而 `pnpm pack` 永远排除 `node_modules`，所以那个 tarball：
+既带不了依赖树、又没声明依赖 → pnpm 装了 **0 个依赖** → 必然解析失败。
+
+**这是个逻辑死结，必须靠"两种形态相反"来解**：
+
+| 形态 | `dependencies` | 为什么 |
+|---|---|---|
+| 自包含目录 / zip | **无** | 依赖树就在旁边的 `node_modules`，声明了反而触发 `allowBuilds` 门槛 |
+| tarball | **有 `serialport`** | 没有依赖树，只能靠声明去 registry 拉（代价是要 `allowBuilds`） |
+
+**修法**：`pack.ps1` 为 tarball 单独建一份 staging，manifest 用**源码的**
+（保留 `serialport` 声明）；只有 zip 用剥掉依赖的版本。
+`verify-dist.mjs` 加了断言分别守住这两条相反的要求 —— 正是"少了一个包"这种
+错误最难靠肉眼发现。
+
+**教训**：**"安装成功"不等于"装对了"。** 判断标准必须是"从安装位真的能 `import`
+到依赖"，而不是"命令退出码是 0"。现在 `install.ps1` 和 `verify-dist.mjs`
+都在做这个真实加载检查。
+
+### 行尾不一致导致哈希核对失效
+
+Windows 上 git 默认 `core.autocrlf=true`，检出时把 LF 转成 CRLF，于是：
+
+```
+CI 检出（GitHub runner）: LF   → lib/index.js 35964 字节
+本地检出（Windows）      : CRLF → lib/index.js 36912 字节
+```
+
+同一个文件、同样的内容，**哈希不同**。我一度据此以为发布包被污染而花时间排查；
+它还会让"本地打包 == CI 打包"这个有用的断言永远为假。
+
+**修法**：加 `.gitattributes`，显式 `* text=auto eol=lf` 并给各类文件钉死 LF，
+二进制类型标 `binary`。让每种平台检出的字节一致。
+
