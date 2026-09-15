@@ -1,15 +1,14 @@
 {
   "name": "dsh-led-bridge",
   "version": "0.2.7",
-  "description": "Stream DeepSeek Harness (DSH) live work status to an ESP32-C3 traffic-light desk toy over USB serial. An experimental bridge; the full multi-output plugin is dsh-beacon.",
+  "description": "Broadcast DeepSeek Harness (DSH) live work status over USB serial. The plugin reports facts only; any serial-capable endpoint decides how to render them.",
   "keywords": [
     "dsh",
     "dsh-plugin",
     "deepseek-harness",
-    "esp32",
-    "esp32-c3",
     "status-light",
-    "serial"
+    "serial",
+    "usb"
   ],
   "type": "module",
   "main": "lib/index.js",

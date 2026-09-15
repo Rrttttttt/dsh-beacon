@@ -1,210 +1,144 @@
-# dsh-beacon
+# dsh-led-bridge
 
-一个通过 dsh 插件串口广播 dsh 工作状态的插件，适用于 esp-32 c3 灯光控制。
+把 DeepSeek Harness 的实时工作状态**广播**出去。
 
-> ## ⚠️ 名字对不上是**故意的**，先看这段
->
-> | 名字 | 是什么 | 现在的状态 |
-> |---|---|---|
-> | 仓库 `dsh-beacon` | **将来的最终形态**：ESP32 红绿灯 **+ 系统托盘 + 桌面悬浮球 + Windows 通知 + 余额/消耗** | 只有设计稿 |
-> | 包 `dsh-led-bridge` | **今天就能用的试验版**：只把 DSH 状态推给 ESP32-C3 红绿灯 | ✅ 已发布、已实测 |
->
-> 所以你在本仓库看到的、下载到的、安装的，**都是 `dsh-led-bridge`** ——
-> Release 里的文件名、`package.json` 的包名、`dsh plugin` 里登记的 id，全都是它。
-> `dsh-beacon` 目前只是一个仓库名。
->
-> bridge 会**成为 beacon 的一个输出通道（sink）**，到那时才谈得上改名。
-> 在那之前，本 README、`plugin/README.md`、`docs/` 说的都是 bridge。
->
-> ### ⚠️ 但 `dsh-beacon` 这个 **npm 包名已经被别人拿走了**
->
-> 实测 `registry.npmjs.org/dsh-beacon` 返回 200，占用者 `dushaobindoudou`，
-> 版本 `0.0.1`，描述写着 "name reserved"（2026-09-10 注册）。
-> **将来 beacon 真要发布时，这个名字拿不到。**
->
-> 而改名会牵连一串东西：包名、Release 文件名、workflow artifact 名、
-> 安装目录名（`~/.dsh/plugins/<包名>-<profile>`）、以及用户 profile 里已登记的 id。
-> **越早定越便宜。**
->
-> 实测**可用**的备选（2026-09-15 查询）：
->
-> | 备选名 | npm 状态 |
-> |---|---|
-> | `dsh-beacon-widget` | ✅ 可用 |
-> | `dsh-status-beacon` | ✅ 可用 |
-> | `dsh-signal-beacon` | ✅ 可用 |
-> | `deepseek-harness-beacon` | ✅ 可用 |
-> | `dsh-lantern` | ✅ 可用 |
-> | `dsh-status-light` | ✅ 可用 |
->
-> 或者用 **scoped 名**（`@你的用户名/dsh-beacon`）—— scoped 命名空间归账号所有，
-> 不会被抢。要占位就现在发一个 `0.0.1`（`npm publish --access public`）。
+## 它本来要解决什么
 
----
+DSH 在终端里跑。你盯着屏幕的时候，一眼就知道它是在想、在跑工具、还是卡在权限确认上。
 
-## 它是做什么的
+但你一离开屏幕 —— 去倒水、去开会、切到别的窗口 —— 这些信息就没了。它还在跑吗？
+还是早就停下来等你了？终端不会告诉你，因为**状态只存在于那一个窗口里**。
 
-DSH（DeepSeek Harness）在干活时，状态只存在于电脑里。这个插件把它变成**抬头就能看见**的东西：
+这个插件把 DSH 的工作状态变成一条可以被外部读取的信号，让"它现在在干什么"这件事
+不再依赖你盯着某一个屏幕。
 
-| 颜色 | 含义 |
+## 它只上报事实，不做渲染决定
+
+| 它做 | 它不做 |
 |---|---|
-| 🟡 黄灯**呼吸** | 模型正在思考 / 生成 |
-| 🟡 黄灯**快闪** | **在等你确认**（权限申请） |
-| 🟢 绿灯**常亮** | 一轮答完了 |
-| 🟢 绿灯**呼吸**（与黄灯错相） | 有工具正在执行 |
-| 🔴 红灯**常亮** | 出错 / 模型重试 |
-| ⚫ 全灭 | 待机 |
+| 发 `thinking`、`error`、`tools on` 这类**状态命令** | 决定灯怎么亮、亮多久 |
+| 告诉接收端"发生了什么" | 决定呼吸多快、闪几下、什么时候熄 |
+| 设备掉线后自己等待重连 | 假设接收端一定是一盏灯 |
 
-> **架构约定**：插件只报告**事实**（前景状态 / 计划模式 / 有无工具在跑），
-> **全部灯效渲染与时间控制都在固件里**。
->
-> 插件配置里**没有任何灯效时长参数** —— 呼吸快慢、工具尾巴长短、空闲灭灯全在固件常量里，
-> 改它们要重烧。插件里只有两个与"时长"沾边的键，都不是灯效：
-> `alarmTimeoutMs`（防止灯卡在 alarm）与 `reconnectIntervalMs`（连不上板子时的重试间隔）。
-> `scripts/audit-boundaries.mjs` 有一条白名单断言守着这个边界。
+所以插件里**没有任何灯效时长参数**。同一个插件可以驱动完全不同的输出端，因为它们
+各自决定怎么把事实表现出来。
 
-> **「空闲自动灭灯」也是固件独占的**（固件常量 `STALE_TIMEOUT_MS`，默认 5 分钟）。
-> 插件曾经也有一份 `idleTimeoutMs`，已经删掉，因为那是同一件事的两份实现：
-> 它是个**骗人的旋钮**（固件那份无条件生效，所以把它设成 0 或调大都不起作用），
-> 而且两者语义不同（插件测「多久没有新状态」，固件测「多久没有串口活动」），
-> 会让一次**很长的推理**被误判成空闲而灭灯。
-> 要改这个超时：改 `.ino` 里的 `STALE_TIMEOUT_MS` 并重烧。
+## 输出端可以是任何东西
 
----
+协议就是**一行纯文本**。任何能读串口的设备或程序都能当输出端：
+
+| 输出端 | 例子 |
+|---|---|
+| 桌面状态灯 | 我们自己的第一个接收端：一盏三色交通灯（ESP32-C3 + 红/黄/绿三颗 LED） |
+| 灯带 / 氛围灯 | WS2812、任何可编程灯 |
+| 其它开发板 | Arduino、Raspberry Pi Pico、任何带 USB 串口的单片机 |
+| 电脑上的小程序 | 托盘图标、系统通知、OBS 叠加层、第二块屏上的状态条 |
+| 纯软件 | 一个 `while read line` 的 shell 脚本也算 |
+
+上面那盏交通灯只是**第一个**接收端，不是这个插件的边界。仓库 `dsh-beacon` 会承载
+在此基础上扩展的多元输出版本。
+
+## 发送的命令
+
+| 命令 | 含义 |
+|---|---|
+| `off` | 待机 |
+| `thinking` | 模型正在生成 |
+| `success` | 一轮答完 |
+| `error` | 出错 / 模型重试 |
+| `alarm` | 等你批准权限（最高优先级） |
+| `tools on` / `tools off` | 有 / 没有工具在执行（独立事实，不改前景状态） |
+| `notify [状态]` | 一个"该看一眼了"的提示：接收端可以用任何方式表现它（闪一下、响一声、弹个通知）；不写状态则提示完回到之前的状态 |
+| `<状态>+plan` | 计划模式背景修饰，可与任一前景状态组合 |
+
+`alarm` 的回落时间由 `alarmTimeoutMs` 控制（默认 60 秒；`0` = 永不回落）。
+
+接收端回 `READY` 表示握手完成，回 `OK <cmd>` / `ERR <text>` 表示执行结果。
+插件不要求接收端必须回执：不回也能用，只是看不到确认。
 
 ## 安装
 
-### 方式一：自包含包（推荐，零配置）
-
-从 [Releases](https://github.com/Rrttttttt/dsh-beacon/releases) 下载 `dsh-led-bridge-<版本>.zip`，
-解压后运行：
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\dsh-led-bridge\install.ps1
-```
-
-它会自动完成注册，**不需要手工改任何配置文件**。脚本做三件事：
-把插件放到 `~/.dsh/plugins/`（路径含空格时会自动换位置）、
-`dsh plugin add` 注册进 profile、然后验证插件层是否真的生效。
-
-### 方式二：npm 包 —— ⚠️ **尚未发布，现在跑必然失败**
-
-> **`dsh-led-bridge` 还没有发布到 npm**（实测 `registry.npmjs.org/dsh-led-bridge` 返回 404）。
-> 下面这条命令**现在会直接报 404**。要用这条路，得先由作者按
-> [docs/DISTRIBUTION.md](./docs/DISTRIBUTION.md) 第四节手工 `npm publish` 一次。
-> 在那之前请走**方式一**（自包含包）或**方式三**（源码）。
-
 ```sh
-# 仅当包已发布到 npm 之后才可用
-dsh plugin --profile web add dsh-led-bridge
+dsh plugin --profile web add "link:<本目录绝对路径>"
+dsh --profile web --dump-config   # 验证：应能看到一层 dsh-led-bridge
 ```
 
-> ⚠️ **即使包已发布，这种方式也需要手工加一项配置。** 插件的依赖 `serialport` 会拉下
-> `@serialport/bindings-cpp`，它带 install 脚本；pnpm ≥ 10 默认拦截构建脚本并
-> **以退出码 1 结束**，而 `dsh plugin` 只在退出码为 0 时才登记插件 ——
-> 结果是包进了 `dependencies`，却**永远不进 `dsh.profile.bundles`**，
-> DSH 静默不加载它。
+插件依赖 `serialport`。安装时 pnpm ≥ 10 会拦截 `@serialport/bindings-cpp` 的构建脚本
+并以退出码 1 结束；而 `dsh plugin` 只在 pnpm 退出码为 0 时才登记插件，于是会**装上了
+却没被加进 `dsh.profile.bundles`**。此时在 profile 的 `pnpm-workspace.yaml` 里加：
+
+```yaml
+allowBuilds:
+  '@serialport/bindings-cpp': true
+```
+
+装完**必须重启 DSH**：插件配置只在进程启动时读一次。
+
+> **路径含空格时先换个位置。** `dsh plugin` 在 Windows 上用 `shell:true` 起 pnpm，
+> 会丢掉参数引号：带空格的 spec 被拆成多个参数，pnpm 转而去 registry 找一个不存在的包，
+> 以 404 失败。所以先把目录拷到不含空格的路径再 `link:`，例如：
 >
-> 在 `~/.dsh/profiles/web/pnpm-workspace.yaml` 里加：
->
-> ```yaml
-> allowBuilds:
->   '@serialport/bindings-cpp': true
+> ```sh
+> robocopy "<本目录>" "%USERPROFILE%\.dsh\plugins\dsh-led-bridge" /E
+> dsh plugin --profile web add "link:%USERPROFILE%/.dsh/plugins/dsh-led-bridge"
 > ```
 >
-> 这一项**无法全局设置**（pnpm 会拒绝 `ERR_PNPM_CONFIG_SET_UNSUPPORTED_YAML_CONFIG_KEY`），
-> 所以只能每台机器手工加。**这正是方式一存在的原因。**
-> 详见 [docs/DISTRIBUTION.md](./docs/DISTRIBUTION.md)。
+> 拷副本而不是原地引用还有第二个好处：每个 profile 各有一份，装机测试不会互相覆盖。
 
-### 方式三：从源码
+## 配置
 
-```sh
-git clone https://github.com/Rrttttttt/dsh-beacon.git
-cd dsh-beacon
-dsh plugin --profile web add "link:$PWD/plugin"
+在 profile 的 `cordis.patch.yml` 里按 `id` 覆盖（`config` 是整体替换，要保留的键一起写上）：
+
+```yaml
+- id: dsh-led-bridge
+  config:
+    port: COM7                # 跳过自动发现；空串 = 自动
+    vendorId: '303a'          # 接收端的 USB 厂商号
+    productId: '1001'         # 接收端的 USB 产品号
+    baudRate: 115200
+    alarmTimeoutMs: 60000     # alarm 超时回落（毫秒）；0 = 永不回落
+    reconnectIntervalMs: 5000 # 找不到设备时的重试间隔
 ```
 
-同样需要上面那条 `allowBuilds`（源码没自带依赖树）。
+## 串口自动发现
 
-**安装后都要重启 DSH** —— profile 配置只在启动时读一次，正在运行的 DSH
-不会加载新装上的插件。
+不写死端口号。按 USB VID/PID 匹配；macOS 上部分平台拿不到 VID/PID，退回按设备名
+匹配 `usbmodem|usbserial|ttyACM|ttyUSB`。找不到设备时按 `reconnectIntervalMs` 重试；
+设备拔掉后自动等待重新接入，不需要重启 DSH。
 
----
+换成别的接收端时，把 `vendorId` / `productId` 改成它自己的，或者直接用 `port` 写死。
 
-## 硬件
+## 事件 → 状态
 
-ESP32-C3（本工程用的是 ESP32-C3-MINI-1 / ESP32-C3FN4）原生 USB-Serial/JTAG，
-不需要 CH340 之类的转串口芯片。
-
-| 灯 | GPIO |
+| 事件 | 动作 |
 |---|---|
-| 红 | GPIO5 |
-| 黄 | GPIO6 |
-| 绿 | GPIO7 |
+| `step/start` `step/end` `assistant/attempt` `assistant/message` `turn/start` | `thinking` |
+| `tool/call` `tool-workflow/run-start` `tool-workflow/agent-start` `command/run` `compaction/start` | `tools on` |
+| 上述开工事件**配对得上**的收工事件 | `tools off`（配不上则忽略，绝不动计数） |
+| `turn/start` `turn/end` | 无条件清空活动记录（丢掉跨轮残留） |
+| `turn/end` | `success`（计划模式开着时：`notify success+plan`） |
+| `llm/retry` `llm/retry-started` | `error` |
+| 配对收工事件里带错误标记 | `error` |
+| `approval/asked` | `alarm`（最高优先级，期间其他事件不夺权） |
+| `approval/decided` | 回到 `thinking` |
+| `plan/mode {active:true}` | 进入计划模式：当前状态加 `+plan` 修饰 |
+| `plan/mode {active:false}` | 退出：`notify <当前状态>`，提示后回到前景状态 |
+| `goal/change` `sandbox/mode` | 只 `notify`，不改状态 |
+| `session/end-seed` | `off`（并清掉计划模式） |
 
-固件源码在 [`firmware/esp32c3_dsh_status_light/`](./firmware/esp32c3_dsh_status_light/)，
-用 Arduino IDE（esp32 core 3.x）编译烧录。编译选项见
-[`scripts/build.ps1`](./scripts/build.ps1)。
+事件名取自 `@deepseek-ai/dsh-session` 的 `known-event-types`。子智能体、多会话、
+`todo/write`、`team/*` 等按约定刻意忽略。
 
-> ⚠️ **板上必须烧了固件。** 出厂空 Flash 会让 ESP32-C3 反复复位
-> （`invalid header` + `TG0WDT_SYS_RST`），Windows 就会不停播 USB 连接音。
-> 灯效在固件里，插件只发文本命令 —— 没烧固件的话插件怎么装都不会有反应。
+工具追踪按 ID 精确配对而不是盲计数：只有配对得上的收工事件才能移除记录，配不上的
+安全忽略。早期版本用加减计数，真机上收工事件比开工事件多，计数永远回不到 0，
+于是插件再也不发 `tools off`。
 
----
-
-## 仓库结构
-
-```
-plugin/                     DSH 插件源码（纯 JS，跑在电脑上）
-  lib/index.js              全部逻辑（单文件）
-  cordis.patch.yml          DSH 挂载声明
-firmware/                   ESP32-C3 固件
-  esp32c3_dsh_status_light/ Arduino 工程（.ino）
-scripts/                    工具脚本
-  pack.ps1                  打包出两种安装形态
-  install-dist.ps1          目标机安装脚本（会被打进自包含包）
-  verify-all.mjs            总验证：静态 / 自测 / 协议 / 架构
-  verify-dist.mjs           产物验证：确认打出来的包真的能装
-  verify-no-lamp-logic.mjs  架构守卫：证明插件里没有灯效代码
-  selftest.mjs              离线自测
-  simulate.mjs              端到端模拟（含固件灯效规则的移植）
-  build.ps1                 编译烧录固件
-docs/                       说明文档
-```
-
----
-
-## 验证
+## 卸载
 
 ```sh
-node scripts/verify-all.mjs            # 逻辑全绿（含 selftest / simulate）
-node scripts/verify-no-lamp-logic.mjs  # 确认插件里没有灯效代码
-node scripts/audit-boundaries.mjs      # 架构边界（空闲灭灯只许在固件里等）
-node scripts/verify-no-pipe-deps.mjs   # 守卫：验证脚本不许依赖管道子进程
-powershell -File scripts/pack.ps1      # 打包
-node scripts/verify-dist.mjs           # 确认产物可用（含 tar 头与 JSON 字节断言）
-node scripts/verify-reproducible.mjs   # 确认打包可复现（跨 PowerShell 版本字节一致）
+dsh plugin --profile web remove dsh-led-bridge
 ```
 
-> **这些必须留在一个能开子进程的终端里跑。** `verify-reproducible.mjs` 需要启动
-> PowerShell 才能比对版本；受限沙箱里它会明确报「本环境无法运行此项检查（已跳过）」
-> 并退出 0 —— 那是**跳过**不是失败，换普通终端再跑一次才算数。
->
-> CI 上这些都在 `.github/workflows/release.yml` 里跑，**改完验证脚本记得同步那边**——
-> 早先 `verify-reproducible.mjs` 就漏在 CI 和这份清单之外，等于没在守卫。
+## License
 
-发版：
-
-```sh
-# 1. 改 plugin/package.json 的 version
-# 2. 本地验证全绿
-# 3. 打标签推送，GitHub Actions 会自动构建并创建 Release
-git tag v<版本>          # 例如 v0.2.4
-git push origin v<版本>
-```
-
----
-
-## 许可
-
-MIT，见 [LICENSE](./LICENSE)。
+MIT
