@@ -21,7 +21,7 @@
  * 跑法：node scripts/verify-no-lamp-logic.mjs
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { decodeMultiFrameZstd } from './zstd-frames.mjs'
@@ -260,11 +260,27 @@ function currentAlgorithm(events) {
 /** 只保留"影响前景灯"的命令，滤掉工具开关（那正是本次要改的） */
 const foregroundOnly = (cmds) => cmds.filter((c) => !c.startsWith('tools '))
 
+/**
+ * 找本机的 DSH 会话日志。
+ *
+ * 为什么必须容错：这一段是「行为等价性对照」，需要**本机真实会话事件**当样本 ——
+ * 但 `~/.dsh/sessions` 是用户机器上的运行数据，**CI 运行器上没有**。
+ * 早期版本直接 walk 那个目录，在 GitHub Actions 上抛 ENOENT、退出码 1，
+ * 把整个 workflow 拖挂了。所以这里缺目录就返回空数组，
+ * 由调用方降级为「跳过行为对照，只做结构性检查」。
+ */
 function loadSessions(limit) {
   const root = join(homedir(), '.dsh', 'sessions')
   const found = []
+  if (!existsSync(root)) return found
   const walk = (d) => {
-    for (const ent of readdirSync(d, { withFileTypes: true })) {
+    let entries
+    try {
+      entries = readdirSync(d, { withFileTypes: true })
+    } catch {
+      return
+    }
+    for (const ent of entries) {
       const p = join(d, ent.name)
       if (ent.isDirectory()) walk(p)
       else if (ent.name.startsWith('session.') && ent.name.includes('.jsonl'))
@@ -283,6 +299,12 @@ let compared = 0
 let totalEvents = 0
 let mismatchSessions = 0
 const firstMismatch = []
+
+if (sessions.length === 0) {
+  console.log('  --   跳过：本机没有 DSH 会话日志（CI 上是正常的）')
+  console.log(`       查找位置: ${join(homedir(), '.dsh', 'sessions')}`)
+  console.log('       结构性检查（上面 [1] 段）不依赖会话日志，仍然有效。')
+}
 
 for (const s of sessions) {
   let text
@@ -326,11 +348,13 @@ for (const s of sessions) {
   }
 }
 
-check(
-  `前景状态命令逐条一致（${compared} 个会话 / ${totalEvents} 个事件）`,
-  mismatchSessions === 0,
-  mismatchSessions === 0 ? '' : `${mismatchSessions} 个会话有差异`,
-)
+if (sessions.length > 0) {
+  check(
+    `前景状态命令逐条一致（${compared} 个会话 / ${totalEvents} 个事件）`,
+    mismatchSessions === 0,
+    mismatchSessions === 0 ? '' : `${mismatchSessions} 个会话有差异`,
+  )
+}
 
 if (firstMismatch.length) {
   const d = firstMismatch[0]
@@ -343,6 +367,9 @@ if (firstMismatch.length) {
 console.log('\n[3] 工具开关命令的差异（预期存在，正是本次修复目标）\n')
 let toolOld = 0
 let toolNew = 0
+if (sessions.length === 0) {
+  console.log('  --   跳过：同样需要本机会话日志')
+}
 for (const s of sessions) {
   let text
   try {
@@ -373,7 +400,13 @@ console.log('  （数量不同是预期的：按 ID 配对后，配不上的收�
 console.log('\n=== 结论 ===')
 if (failures === 0) {
   console.log('  ✅ 插件里没有任何灯效/亮度/时序代码，也没有新增定时器。')
-  console.log('  ✅ 修复前后「前景状态」命令逐条完全一致 —— 灯的行为没变。')
+  if (sessions.length > 0) {
+    console.log('  ✅ 修复前后「前景状态」命令逐条完全一致 —— 灯的行为没变。')
+  } else {
+    // 别在没有样本的时候宣称"一致"：那正是"证据不足却下结论"。
+    console.log('  ·  行为等价性对照**未执行**（本机没有 DSH 会话日志作为样本）。')
+    console.log('     结构性检查已通过；要跑行为对照请在用过 DSH 的机器上重跑本脚本。')
+  }
   console.log('  ✅ 唯一改变的是「工具开关何时上报」，即本次要修的那个 bug。')
 } else {
   console.log(`  ❌ 有 ${failures} 项不通过，见上文。`)

@@ -12,7 +12,7 @@
  * 同时统计"未配对的收工事件"数量，确认它们被安全忽略而不是把状态带偏。
  */
 
-import { readFileSync, readdirSync, statSync } from 'node:fs'
+import { readFileSync, readdirSync, statSync, existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import { decodeMultiFrameZstd } from './zstd-frames.mjs'
@@ -20,10 +20,24 @@ import { __testing } from '../plugin/lib/index.js'
 
 const { StateMachine, DEFAULTS } = __testing
 
+// 会话日志是用户机器上的运行数据，CI 或全新机器上不存在。
+// 这里必须容错，否则抛 ENOENT 并让调用方的 workflow 挂掉。
 const root = join(homedir(), '.dsh', 'sessions')
 const sessions = []
+if (!existsSync(root)) {
+  console.log(`找不到会话日志目录：${root}`)
+  console.log('这台机器上没有 DSH 会话记录，无法做跨会话核对。')
+  console.log('（在装过 DSH 并用过一段时间的机器上跑这个脚本才有意义。）')
+  process.exit(0)
+}
 const walk = (d) => {
-  for (const ent of readdirSync(d, { withFileTypes: true })) {
+  let entries
+  try {
+    entries = readdirSync(d, { withFileTypes: true })
+  } catch {
+    return
+  }
+  for (const ent of entries) {
     const p = join(d, ent.name)
     if (ent.isDirectory()) walk(p)
     else if (ent.name.startsWith('session.') && ent.name.includes('.jsonl'))
