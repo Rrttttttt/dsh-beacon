@@ -1,16 +1,9 @@
-# 依赖
 node_modules/
-
-# pnpm 本机运行时文件（含本机 allowBuilds 授权决定，不进仓库）
 pnpm-lock.yaml
 pnpm-workspace.yaml
-
-# 打包 / 编译产物
 dist/
 *.tgz
 *.zip
-
-# 编辑器 / 系统杂项
 .DS_Store
 Thumbs.db
 *.log

@@ -1,3 +1,1 @@
-# 全仓库统一 LF。Windows 上 core.autocrlf 默认会把工作区换成 CRLF，
-# 造成"同一份代码在两个平台哈希不同"这类难查的问题。
 * text=auto eol=lf
