@@ -1,6 +1,6 @@
 {
   "name": "dsh-led-bridge",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Broadcast DeepSeek Harness (DSH) live work status over USB serial or TCP. The plugin reports facts only; any capable endpoint decides how to render them.",
   "keywords": [
     "dsh",

@@ -22,7 +22,7 @@ const uint32_t CONFIG_SESSION_MS   = 600000;
 const uint32_t WIFI_RETRY_MS       = 5000;
 const uint32_t SETUP_WIFI_WAIT_MS  = 15000;
 
-const char *FW_VERSION = "1.0.0";
+const char *FW_VERSION = "1.0.1";
 
 const char *AP_PREFIX = "DSH-Beacon";
 const char *NVS_NS    = "dsh-led";
