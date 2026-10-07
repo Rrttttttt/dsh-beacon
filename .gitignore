@@ -1,0 +1,14 @@
+node_modules/
+.tools/
+.build/
+.pio/
+dist/
+*.bin
+*.elf
+*.map
+*.log
+__pycache__/
+.env
+.env.*
+!.env.example
+*.local.yml
