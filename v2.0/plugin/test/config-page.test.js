@@ -23,12 +23,26 @@ test('opening the config page does not start network scans or extra requests', (
   assert.deepEqual(requests, [])
 })
 
-test('scan results preserve exact SSIDs as option values', async () => {
+test('scan results are visible buttons with exact SSID values', async () => {
   const names = ['wifi-A', 'a"\\b', '<img src=x onerror=alert(1)>']
   const d = browser(async (url) => ({ json: async () => url === '/scanresult' ? names : { scanning: true } }))
   await d.getElementById('scanbtn').onclick()
   assert.deepEqual(d.getElementById('nets').children.map((o) => o.value), names)
+  assert.equal(d.getElementById('net-results').hidden, false)
+  const buttons = d.getElementById('nets').children
+  assert.equal(buttons[2].textContent, names[2])
+  assert.equal(buttons[2].type, 'button')
+  buttons[2].onclick()
+  assert.equal(d.getElementById('ssid').value, names[2])
   assert.equal(d.getElementById('scanbtn').disabled, false)
+})
+
+test('scanning lists each distinct SSID once and keeps manual input', async () => {
+  const d = browser(async (url) => ({ json: async () => url === '/scanresult' ? ['wifi-A', 'wifi-A', '', 'WIFI-A', 'wifi-B'] : { scanning: true } }))
+  d.getElementById('ssid').value = 'manual-network'
+  await d.getElementById('scanbtn').onclick()
+  assert.deepEqual(d.getElementById('nets').children.map((o) => o.value), ['wifi-A', 'WIFI-A', 'wifi-B'])
+  assert.equal(d.getElementById('ssid').value, 'manual-network')
 })
 
 test('saving uses a POST body and preserves password spaces and punctuation', async () => {

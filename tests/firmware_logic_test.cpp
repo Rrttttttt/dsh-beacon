@@ -22,6 +22,9 @@ int main() {
   assert(jsonQuote(std::string("a\"\\b\n\t")) == "\"a\\\"\\\\b\\u000a\\u0009\"");
   assert(jsonQuote(std::string("\xe7\xbd\x91\xe7\xbb\x9c")) == "\"\xe7\xbd\x91\xe7\xbb\x9c\"");
   assert(htmlEscape(std::string("<&\"'>")) == "&lt;&amp;&quot;&#39;&gt;");
+  const std::string names[] = {"wifi-A", "wifi-A", "", "wifi-B", "wifi-A", "a\"\\b", "a\"\\b", "WIFI-A"};
+  assert(ssidListJson<std::string>(8, [&](int i) { return names[i]; }) == "[\"wifi-A\",\"wifi-B\",\"a\\\"\\\\b\",\"WIFI-A\"]");
+  assert(ssidListJson<std::string>(0, [&](int i) { return names[i]; }) == "[]");
   assert(isStateCommand(std::string("thinking+plan")));
   assert(!isStateCommand(std::string("wifi clear")));
   assert(!isStateCommand(std::string("power bod off")));

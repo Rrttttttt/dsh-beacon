@@ -23,7 +23,7 @@ const uint32_t CONFIG_TIMEOUT_MS   = 15000;
 const uint32_t CONFIG_SESSION_MS   = 600000;
 const uint32_t WIFI_RETRY_MS       = 5000;
 
-const char *FW_VERSION = "2.1.0";
+const char *FW_VERSION = "2.1.1";
 
 const char *AP_PREFIX = "DSH-Beacon";
 const char *NVS_NS    = "dsh-led";
@@ -220,10 +220,11 @@ const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
 <title>DSH 状态灯配网</title>
 <style>body{font-family:system-ui,sans-serif;max-width:520px;margin:24px auto;padding:0 18px;color:#222;background:#f5f5f7}section{background:white;padding:18px;border-radius:12px;margin:16px 0}label{display:block;margin-top:14px}input,button{width:100%;box-sizing:border-box;padding:11px;margin-top:6px}button{cursor:pointer}td{padding:5px}#status{white-space:pre-wrap}</style>
 </head><body><h1>DSH 状态灯</h1><p>选择 2.4GHz Wi-Fi，保存后立即连接。</p>
-<section><form id="wifi-form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" list="nets" required autocomplete="off"><datalist id="nets"></datalist>
+<section><form id="wifi-form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" required autocomplete="off">
+<div id="net-results" hidden><p>扫描结果（点按名称填入）</p><div id="nets" style="max-height:240px;overflow:auto"></div></div>
 <label for="pass">密码</label><input id="pass" type="password" autocomplete="new-password">
 <button id="scanbtn" type="button">扫描附近 Wi-Fi</button><button type="submit">保存并连接</button></form><p id="status" role="status"></p></section>
-<section><p>固件 2.1.0 · 配网发射功率 8 dBm</p><button id="info" type="button">读取诊断信息</button><pre id="diagnostics"></pre><button id="forget" type="button">清除 Wi-Fi 凭据</button></section>
+<section><p>固件 2.1.1 · 配网发射功率 8 dBm</p><button id="info" type="button">读取诊断信息</button><pre id="diagnostics"></pre><button id="forget" type="button">清除 Wi-Fi 凭据</button></section>
 <script>
 const status=document.getElementById('status'), scanbtn=document.getElementById('scanbtn');
 document.getElementById('info').onclick=async function(){
@@ -239,8 +240,14 @@ scanbtn.onclick=async function(){
       const r=await fetch('/scanresult',{cache:'no-store'}), data=await r.json();
       if(data.scanning)continue;
       const list=document.getElementById('nets');list.replaceChildren();
-      for(const name of data){const option=document.createElement('option');option.value=name;list.appendChild(option);}
-      status.textContent=data.length?'扫描完成，请选择网络':'没有发现网络，可直接填写名称。';return;
+      const names=[...new Set(data)].filter(name=>typeof name==='string'&&name.length);
+      for(const name of names){
+        const button=document.createElement('button');button.type='button';button.value=name;button.textContent=name;
+        button.onclick=function(){document.getElementById('ssid').value=name;status.textContent='已选择：'+name;};
+        list.appendChild(button);
+      }
+      document.getElementById('net-results').hidden=!names.length;
+      status.textContent=names.length?'找到 '+names.length+' 个网络，请点按列表中的名称。':'没有发现网络，可直接填写名称。';return;
     }
     throw new Error('扫描超时，请重试');
   }catch(e){status.textContent=e.message;}
@@ -843,14 +850,7 @@ void enterConfigMode() {
       webServer.send(200, "application/json", "[]");
       return;
     }
-    String json = "[";
-    for (int i = 0; i < n; i++) {
-      const String ssid = WiFi.SSID(i);
-      if (ssid.length() == 0) continue;
-      if (json.length() > 1) json += ",";
-      json += statuslight::jsonQuote(ssid);
-    }
-    json += "]";
+    const String json = statuslight::ssidListJson<String>(n, [](int i) { return WiFi.SSID(i); });
 
     WiFi.scanDelete();
     webServer.send(200, "application/json", json);

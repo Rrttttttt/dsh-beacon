@@ -1,5 +1,6 @@
 #pragma once
 #include <stdint.h>
+#include <vector>
 
 namespace statuslight {
 
@@ -32,6 +33,24 @@ template<class Text> Text jsonQuote(const Text &value) {
     else out += (char)c;
   }
   out += '"';
+  return out;
+}
+
+// Configuration selects an SSID, so repeated access points need one entry.
+template<class Text, class GetName> Text ssidListJson(int count, GetName nameAt) {
+  std::vector<Text> seen;
+  Text out = "[";
+  for (int i = 0; i < count; ++i) {
+    const Text name = nameAt(i);
+    if (!name.length()) continue;
+    bool duplicate = false;
+    for (const auto &previous : seen) if (previous == name) { duplicate = true; break; }
+    if (duplicate) continue;
+    if (!seen.empty()) out += ',';
+    seen.push_back(name);
+    out += jsonQuote(name);
+  }
+  out += ']';
   return out;
 }
 
