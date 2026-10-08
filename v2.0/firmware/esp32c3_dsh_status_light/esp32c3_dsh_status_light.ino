@@ -4,7 +4,9 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 
-#include <esp_private/brownout.h>
+#include <esp_system.h>
+#include <esp_arduino_version.h>
+#include "status_logic.h"
 
 const uint8_t PIN_RED    = 5;
 const uint8_t PIN_YELLOW = 6;
@@ -20,9 +22,8 @@ const uint16_t NET_PORT = 8234;
 const uint32_t CONFIG_TIMEOUT_MS   = 15000;
 const uint32_t CONFIG_SESSION_MS   = 600000;
 const uint32_t WIFI_RETRY_MS       = 5000;
-const uint32_t SETUP_WIFI_WAIT_MS  = 15000;
 
-const char *FW_VERSION = "1.9.0";
+const char *FW_VERSION = "2.1.0";
 
 const char *AP_PREFIX = "DSH-Beacon";
 const char *NVS_NS    = "dsh-led";
@@ -69,10 +70,11 @@ bool     toolsActive        = false;
 bool     toolsHoldPending   = false;
 uint32_t toolsOffAtMs       = 0;
 
-bool     notifyActive  = false;
-uint32_t notifyStartMs = 0;
-String   notifyAfter   = "";
-String   savedState    = "";
+statuslight::Notification<String> notification;
+bool &notifyActive = notification.active;
+uint32_t &notifyStartMs = notification.began;
+String &notifyAfter = notification.after;
+String &savedState = notification.saved;
 
 uint32_t savedClearedCount = 0;
 
@@ -89,9 +91,13 @@ uint32_t lastConfigActivityMs = 0;
 bool     netUp       = false;
 bool     netAttached = false;
 bool     scanRunning = false;
+bool     configRoutesRegistered = false;
 uint32_t scanStartedMs = 0;
-uint32_t lastAttemptMs = 0;
-bool     connectPending = false;
+statuslight::RetryClock wifiRetry;
+volatile uint16_t lastWifiDisconnectReason = 0;
+uint16_t reportedWifiDisconnectReason = 0;
+bool wifiConfigPending = false;
+uint32_t wifiConfigApplyMs = 0;
 
 bool usbMode = false;
 
@@ -100,15 +106,15 @@ bool switchWifiPreferred = false;
 bool switchRawAtBoot = false;
 
 const uint32_t SWITCH_DEBOUNCE_MS = 50;
-const uint32_t SWITCH_POLL_MS     = 200;
 
 void reportResetReason();
 void reportBootMode();
 const char *resetReasonText();
-void markIntentionalRestart(const char *why);
-bool waitForSerialInput(uint32_t ms);
+void recordBootStage(const char *stage);
 
 void announceReady(const char *why);
+void announceReady(const char *why, Print &output);
+bool applyCommand(const String &raw, Print &output, bool allowManagement);
 
 bool readModeSwitchWifiPreferred();
 
@@ -123,9 +129,10 @@ RTC_NOINIT_ATTR struct {
   char     resetText[56];
 
   char     prevResetText[56];
+  char     lastStage[24];
 } bootDiag;
 
-const uint32_t BOOT_DIAG_MAGIC = 0xD5C3E501u;
+const uint32_t BOOT_DIAG_MAGIC = 0xD5C3E502u;
 
 const uint8_t RX_LOG_MAX = 8;
 
@@ -147,20 +154,20 @@ void recordRx(const String &cmd) {
   if (rxLogCount < RX_LOG_MAX) rxLogCount++;
 }
 
-void printRxLog() {
-  Serial.print("RX(");
-  Serial.print(rxLogCount);
-  Serial.print(")");
+void printRxLog(Print &output) {
+  output.print("RX(");
+  output.print(rxLogCount);
+  output.print(")");
   const uint8_t start = (rxLogCount < RX_LOG_MAX) ? 0 : rxLogNext;
   for (uint8_t i = 0; i < rxLogCount; i++) {
     const RxLogEntry &e = rxLog[(start + i) % RX_LOG_MAX];
-    Serial.print(' ');
-    Serial.print(e.cmd);
-    Serial.print('@');
-    Serial.print(e.ms);
-    if (i + 1 < rxLogCount) Serial.print('|');
+    output.print(' ');
+    output.print(e.cmd);
+    output.print('@');
+    output.print(e.ms);
+    if (i + 1 < rxLogCount) output.print('|');
   }
-  Serial.println();
+  output.println();
 }
 
 const char *lastRxCmd() {
@@ -174,6 +181,7 @@ bool     rtcLost      = false;
 uint32_t nvsBootCount = 0;
 String   nvsLastReset = "";
 String   nvsPrevReset = "";
+String   previousBootStage = "unknown";
 
 void recordResetHistory();
 
@@ -190,15 +198,12 @@ WiFiClient *netClient = nullptr;
 
 uint32_t netInboundMs = 0;
 
-uint32_t netProbeMs   = 0;
-uint32_t netProbeFail = 0;
+const uint32_t NET_CLIENT_IDLE_MS = 90000;
 
-const uint32_t NET_PROBE_IDLE_MS = 15000;
-
-uint8_t  cfgTxPowerDbm = 20;
+uint8_t  cfgTxPowerDbm = 13;
 
 uint8_t  cfgConfigTxDbm = 8;
-bool     cfgBodEnabled = true;
+// Brownout protection is owned by ESP-IDF startup; never register it again.
 
 const int8_t TX_POWER_CHOICES_DBM[] = {20, 13, 8, 5, 2};
 const size_t TX_POWER_CHOICE_COUNT  = sizeof(TX_POWER_CHOICES_DBM) / sizeof(TX_POWER_CHOICES_DBM[0]);
@@ -210,7 +215,59 @@ DNSServer dnsServer;
 WiFiServer netServer(NET_PORT);
 WiFiUDP   netUdp;
 
-const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>DSH 状态灯配网</title><style>body{font-family:-apple-system,Segoe UI,sans-serif;margin:0;padding:24px;background:#f5f5f7;color:#1d1d1f}h1{font-size:19px;margin:0 0 4px}p.sub{margin:0 0 20px;color:#6e6e73;font-size:13px}.card{background:#fff;border-radius:12px;padding:18px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,.08)}label{display:block;font-size:13px;margin:0 0 6px;color:#6e6e73}input,select,button{width:100%;box-sizing:border-box;font-size:15px;padding:11px;border-radius:8px;border:1px solid #d2d2d7;background:#fff;color:#1d1d1f}button{background:#0071e3;color:#fff;border:0;font-weight:600;cursor:pointer;margin-top:10px}button.sec{background:#e8e8ed;color:#1d1d1f;font-weight:500}table{width:100%;font-size:13px;border-collapse:collapse}td{padding:5px 0;color:#6e6e73}td.v{color:#1d1d1f;text-align:right;font-weight:500}</style></head><body><h1>DSH 状态灯</h1><p class="sub">选一个 WiFi 填密码保存，板子会重启并连上去</p><div class="card"><label>WiFi 名称</label><input id="ssid" list="nets" placeholder="点击下方扫描，或直接输入" autocomplete="off"><datalist id="nets"></datalist><label style="margin-top:14px">密码</label><input id="pass" type="password" placeholder="无密码留空"><button type="button" class="sec" id="scanbtn" onclick="scan()">扫描附近 WiFi</button><button type="button" onclick="save()">保存并重启</button></div><div class="card"><table><tr><td>板子名称</td><td class="v">__NAME__</td></tr><tr><td>固件</td><td class="v">__FW__</td></tr><tr><td>已存凭据</td><td class="v">__SAVED__</td></tr><tr><td>启动次数</td><td class="v">__BOOTS__</td></tr><tr><td>本次启动原因</td><td class="v">__RESET__</td></tr><tr><td>上次启动原因</td><td class="v">__PREVRESET__</td></tr><tr><td>NVS 历史（断电也在）</td><td class="v">__NVSHIST__</td></tr><tr><td>配网发射功率</td><td class="v">__TXP__ dBm</td></tr><tr><td>上次模式/存活</td><td class="v">__PREV__</td></tr></table><button type="button" class="sec" onclick="if(confirm('清除已保存的 WiFi 凭据并重启？'))location='/forget'">恢复出厂</button></div><script>function fill(a){var d=document.getElementById('nets');d.innerHTML=a.map(function(s){return '<option value="'+s.replace(/"/g,'')+'">'}).join('');if(!a.length)alert('没扫到任何 WiFi，再点一次扫描');}function scan(){var b=document.getElementById('scanbtn');b.textContent='扫描中…';var t=0;fetch('/scan',{cache:'no-store'}).then(function(){var iv=setInterval(function(){t++;fetch('/scanresult',{cache:'no-store'}).then(function(r){return r.json()}).then(function(j){if(j.scanning){if(t>40){clearInterval(iv);b.textContent='扫描附近 WiFi';alert('扫描超时，请重试');}return;}clearInterval(iv);b.textContent='扫描附近 WiFi';fill(j);}).catch(function(){clearInterval(iv);b.textContent='扫描附近 WiFi';});},400);});}function save(){var s=document.getElementById('ssid').value.trim();if(!s){alert('请填写 WiFi 名称');return;}location='/save?ssid='+encodeURIComponent(s)+'&pass='+encodeURIComponent(document.getElementById('pass').value);}</script></body></html>)HTML";
+const char CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH 状态灯配网</title>
+<style>body{font-family:system-ui,sans-serif;max-width:520px;margin:24px auto;padding:0 18px;color:#222;background:#f5f5f7}section{background:white;padding:18px;border-radius:12px;margin:16px 0}label{display:block;margin-top:14px}input,button{width:100%;box-sizing:border-box;padding:11px;margin-top:6px}button{cursor:pointer}td{padding:5px}#status{white-space:pre-wrap}</style>
+</head><body><h1>DSH 状态灯</h1><p>选择 2.4GHz Wi-Fi，保存后立即连接。</p>
+<section><form id="wifi-form"><label for="ssid">Wi-Fi 名称</label><input id="ssid" list="nets" required autocomplete="off"><datalist id="nets"></datalist>
+<label for="pass">密码</label><input id="pass" type="password" autocomplete="new-password">
+<button id="scanbtn" type="button">扫描附近 Wi-Fi</button><button type="submit">保存并连接</button></form><p id="status" role="status"></p></section>
+<section><p>固件 2.1.0 · 配网发射功率 8 dBm</p><button id="info" type="button">读取诊断信息</button><pre id="diagnostics"></pre><button id="forget" type="button">清除 Wi-Fi 凭据</button></section>
+<script>
+const status=document.getElementById('status'), scanbtn=document.getElementById('scanbtn');
+document.getElementById('info').onclick=async function(){
+  try{const r=await fetch('/info',{cache:'no-store'});document.getElementById('diagnostics').textContent=JSON.stringify(await r.json(),null,2);}
+  catch(e){status.textContent='读取失败，请重新连接配网热点。';}
+};
+scanbtn.onclick=async function(){
+  scanbtn.disabled=true;scanbtn.textContent='扫描中…';
+  try{
+    await fetch('/scan',{cache:'no-store'});
+    for(let i=0;i<50;i++){
+      await new Promise(r=>setTimeout(r,400));
+      const r=await fetch('/scanresult',{cache:'no-store'}), data=await r.json();
+      if(data.scanning)continue;
+      const list=document.getElementById('nets');list.replaceChildren();
+      for(const name of data){const option=document.createElement('option');option.value=name;list.appendChild(option);}
+      status.textContent=data.length?'扫描完成，请选择网络':'没有发现网络，可直接填写名称。';return;
+    }
+    throw new Error('扫描超时，请重试');
+  }catch(e){status.textContent=e.message;}
+  finally{scanbtn.disabled=false;scanbtn.textContent='扫描附近 Wi-Fi';}
+};
+document.getElementById('wifi-form').onsubmit=async function(e){
+  e.preventDefault();
+  try{
+    const r=await fetch('/save',{method:'POST',body:new URLSearchParams({ssid:document.getElementById('ssid').value,pass:document.getElementById('pass').value})});
+    status.textContent=r.ok?'已保存，正在连接。配网热点将关闭，请回到手机热点所在网络。':await r.text();
+  }catch(e){status.textContent='连接已中断，请查看状态灯或重新连接配网热点。';}
+};
+document.getElementById('forget').onclick=async function(){
+  if(!confirm('清除 Wi-Fi 凭据？'))return;
+  try{const r=await fetch('/forget',{method:'POST'});status.textContent=r.ok?'凭据已清除，请重新配网。':await r.text();}
+  catch(e){status.textContent='请重新连接配网热点。';}
+};
+</script></body></html>)HTML";
+
+#ifdef DSH_MINIMAL_CONFIG_PAGE
+const char MINIMAL_CONFIG_PAGE[] PROGMEM = R"HTML(<!doctype html>
+<html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>DSH 最小配网页</title><h1>DSH 最小配网页</h1>
+<form method="post" action="/save"><p>2.4GHz Wi-Fi 名称 <input name="ssid" required></p>
+<p>密码 <input name="pass" type="password"></p><button>保存并连接</button></form>
+<p><a href="/info">读取诊断信息</a></p></html>)HTML";
+#endif
 
 void writeLed(uint8_t pin, uint16_t brightness) {
   if (brightness > PWM_MAX) brightness = PWM_MAX;
@@ -322,49 +379,61 @@ const char *effectName(LampEffect e) {
   }
 }
 
-bool applyCommand(const String &raw) {
+bool applyCommand(const String &raw, Print &output, bool allowManagement) {
   String cmd = raw;
   cmd.trim();
   cmd.toLowerCase();
   if (cmd.length() == 0) return false;
+  if (!allowManagement && !(statuslight::isStateCommand(cmd) || cmd == "hello" || cmd == "ping" ||
+      cmd == "state?" || cmd == "state" || cmd == "wifi?" || cmd == "wifi" ||
+      cmd == "mode" || cmd == "power" || cmd.startsWith("tools ") || cmd == "notify" || cmd.startsWith("notify "))) {
+    output.println("ERR management requires USB serial");
+    return false;
+  }
+  if (cmd == "hello") {
+    hostHeard = true;
+    announceReady("hello", output);
+    return true;
+  }
+  if (cmd == "ping") return true;
 
   if (cmd == "state?" || cmd == "state") {
-    Serial.print("STATE ");
-    Serial.print(currentState);
-    Serial.print(" | plan=");
-    Serial.print(currentState.endsWith("+plan") ? 1 : 0);
-    Serial.print(" tools=");
-    Serial.print(toolsActive ? 1 : 0);
-    Serial.print(" notify=");
-    Serial.print(notifyActive ? 1 : 0);
-    Serial.print(" saved=");
-    Serial.print(savedState.length() == 0 ? "<none>" : savedState);
-    Serial.print(" after=");
-    Serial.print(notifyAfter.length() == 0 ? "<none>" : notifyAfter);
-    Serial.print(" savedcleared=");
-    Serial.print(savedClearedCount);
-    Serial.print(" loops=");
-    Serial.print(loopCount);
-    Serial.print(" lastloop=");
-    Serial.print(lastLoopMs);
-    Serial.print(" maxloop=");
-    Serial.print(maxLoopMs);
-    Serial.print(" stalls=");
-    Serial.print(stallCount);
-    Serial.print(" now=");
-    Serial.println(millis());
+    output.print("STATE ");
+    output.print(currentState);
+    output.print(" | plan=");
+    output.print(currentState.endsWith("+plan") ? 1 : 0);
+    output.print(" tools=");
+    output.print(toolsActive ? 1 : 0);
+    output.print(" notify=");
+    output.print(notifyActive ? 1 : 0);
+    output.print(" saved=");
+    output.print(savedState.length() == 0 ? "<none>" : savedState);
+    output.print(" after=");
+    output.print(notifyAfter.length() == 0 ? "<none>" : notifyAfter);
+    output.print(" savedcleared=");
+    output.print(savedClearedCount);
+    output.print(" loops=");
+    output.print(loopCount);
+    output.print(" lastloop=");
+    output.print(lastLoopMs);
+    output.print(" maxloop=");
+    output.print(maxLoopMs);
+    output.print(" stalls=");
+    output.print(stallCount);
+    output.print(" now=");
+    output.println(millis());
 
-    Serial.print("LAMPS Y=");
-    Serial.print(effectName(lampYellow.effect));
-    Serial.print(" G=");
-    Serial.print(effectName(lampGreen.effect));
-    Serial.print(" R=");
-    Serial.print(effectName(lampRed.effect));
+    output.print("LAMPS Y=");
+    output.print(effectName(lampYellow.effect));
+    output.print(" G=");
+    output.print(effectName(lampGreen.effect));
+    output.print(" R=");
+    output.print(effectName(lampRed.effect));
 
-    Serial.print(" pol=");
-    Serial.println(ACTIVE_LOW ? "active-low" : "active-high");
+    output.print(" pol=");
+    output.println(ACTIVE_LOW ? "active-low" : "active-high");
 
-    printRxLog();
+    printRxLog(output);
     return true;
   }
 
@@ -373,16 +442,16 @@ bool applyCommand(const String &raw) {
     arg.trim();
 
     if (arg.length() == 0) {
-      Serial.print("POWER tx=");
-      Serial.print(cfgTxPowerDbm);
-      Serial.print("dBm bod=");
-      Serial.print(cfgBodEnabled ? "on" : "off");
-      Serial.print(" choices=");
+      output.print("POWER tx=");
+      output.print(cfgTxPowerDbm);
+      output.print("dBm bod=");
+      output.print("on (framework)");
+      output.print(" choices=");
       for (size_t i = 0; i < TX_POWER_CHOICE_COUNT; i++) {
-        if (i) Serial.print("/");
-        Serial.print(TX_POWER_CHOICES_DBM[i]);
+        if (i) output.print("/");
+        output.print(TX_POWER_CHOICES_DBM[i]);
       }
-      Serial.println();
+      output.println();
       return true;
     }
 
@@ -393,76 +462,65 @@ bool applyCommand(const String &raw) {
         if (TX_POWER_CHOICES_DBM[i] == want) { ok = true; break; }
       }
       if (!ok) {
-        Serial.println("ERR power tx 只认 20/13/8/5/2 (dBm)");
+        output.println("ERR power tx 只认 20/13/8/5/2 (dBm)");
         return true;
       }
       cfgTxPowerDbm = (uint8_t)want;
       savePowerSettings();
       applyPowerSettings();
-      Serial.print("OK power tx=");
-      Serial.print(cfgTxPowerDbm);
-      Serial.println("dBm（发射电流峰值随之下调）");
+      output.print("OK power tx=");
+      output.print(cfgTxPowerDbm);
+      output.println("dBm（发射电流峰值随之下调）");
       return true;
     }
 
+    if (arg == "bod on") {
+      output.println("POWER brownout protection is managed by the framework");
+      return true;
+    }
     if (arg.startsWith("bod ")) {
-      const String v = arg.substring(4);
-      if (v == "on") {
-        cfgBodEnabled = true;
-      } else if (v == "off") {
-        cfgBodEnabled = false;
-      } else {
-        Serial.println("ERR power bod 只认 on/off");
-        return true;
-      }
-      savePowerSettings();
-      applyPowerSettings();
-      Serial.print("OK power bod=");
-      Serial.println(cfgBodEnabled ? "on" : "off");
-      if (!cfgBodEnabled) {
-        Serial.println("注意：掉电检测已关闭，欠压时 flash 有写坏风险，仅用于实验");
-      }
-      return true;
+      output.println("ERR brownout protection cannot be disabled");
+      return false;
     }
 
-    Serial.println("ERR power 只认 tx <n> / bod <on|off>");
+    output.println("ERR power 只认 tx <n> / bod <on|off>");
     return true;
   }
 
   if (cmd == "wifi?" || cmd == "wifi") {
-    Serial.print("WIFI mode=");
-    Serial.print(usbMode ? "usb" : "wifi");
-    Serial.print(" ssid=");
-    Serial.print(wifiSsid.length() == 0 ? "<none>" : wifiSsid);
-    Serial.print(" saved=");
-    Serial.print(wifiSsid.length() == 0 ? 0 : 1);
-    Serial.print(" state=");
-    Serial.print(configMode ? "config" : (WiFi.status() == WL_CONNECTED ? "connected" : "idle"));
-    Serial.print(" ip=");
-    Serial.print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString()
+    output.print("WIFI mode=");
+    output.print(usbMode ? "usb" : "wifi");
+    output.print(" ssid=");
+    output.print(wifiSsid.length() == 0 ? "<none>" : wifiSsid);
+    output.print(" saved=");
+    output.print(wifiSsid.length() == 0 ? 0 : 1);
+    output.print(" state=");
+    output.print(configMode ? "config" : (WiFi.status() == WL_CONNECTED ? "connected" : "idle"));
+    output.print(" ip=");
+    output.print(WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString()
                                                : (configMode ? WiFi.softAPIP().toString() : String("<none>")));
-    Serial.print(" rssi=");
-    Serial.print(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
-    Serial.print(" tcp=");
-    Serial.print(netAttached ? 1 : 0);
+    output.print(" rssi=");
+    output.print(WiFi.status() == WL_CONNECTED ? WiFi.RSSI() : 0);
+    output.print(" tcp=");
+    output.print(netAttached ? 1 : 0);
 
-    Serial.print(" sw=");
-    Serial.print(switchWifiPreferred ? 1 : 0);
-    Serial.print(" swBoot=");
-    Serial.print(switchRawAtBoot ? 1 : 0);
-    Serial.print(" netTalkAge=");
-    Serial.print(netInboundMs == 0 ? 0 : millis() - netInboundMs);
+    output.print(" sw=");
+    output.print(switchWifiPreferred ? 1 : 0);
+    output.print(" swBoot=");
+    output.print(switchRawAtBoot ? 1 : 0);
+    output.print(" netTalkAge=");
+    output.print(netInboundMs == 0 ? 0 : millis() - netInboundMs);
 
-    Serial.print(" tx=");
-    Serial.print(cfgTxPowerDbm);
-    Serial.print("dBm bod=");
-    Serial.print(cfgBodEnabled ? "on" : "off");
-    Serial.print(" scanning=");
-    Serial.print(scanRunning ? 1 : 0);
-    Serial.print(" scanResult=");
-    Serial.print(WiFi.scanComplete());
-    Serial.print(" port=");
-    Serial.println(NET_PORT);
+    output.print(" tx=");
+    output.print(cfgTxPowerDbm);
+    output.print("dBm bod=");
+    output.print("on (framework)");
+    output.print(" scanning=");
+    output.print(scanRunning ? 1 : 0);
+    output.print(" scanResult=");
+    output.print(WiFi.scanComplete());
+    output.print(" port=");
+    output.println(NET_PORT);
     return true;
   }
 
@@ -472,24 +530,24 @@ bool applyCommand(const String &raw) {
 
     if (arg == "clear") {
       clearWifiCreds();
-      Serial.println("凭据已清除，重启进入配网模式");
-      delay(200);
-      markIntentionalRestart("wifi clear");
-      ESP.restart();
+      output.println("OK wifi credentials cleared");
+      wifiConfigPending = true;
+      wifiConfigApplyMs = millis() + 100;
+      return true;
     }
 
     return false;
   }
 
   if (cmd == "mode" || cmd.startsWith("mode ")) {
-    Serial.print("MODE current=");
-    Serial.print(usbMode ? "usb" : "wifi");
-    Serial.print(" switch=");
-    Serial.print(switchWifiPreferred ? "closed(wifi)" : "open(wired)");
-    Serial.print(" switchBoot=");
-    Serial.println(switchRawAtBoot ? 1 : 0);
+    output.print("MODE current=");
+    output.print(usbMode ? "usb" : "wifi");
+    output.print(" switch=");
+    output.print(switchWifiPreferred ? "closed(wifi)" : "open(wired)");
+    output.print(" switchBoot=");
+    output.println(switchRawAtBoot ? 1 : 0);
     if (cmd.length() > 5) {
-      Serial.println("MODE 只读：模式由 GPIO4 拨动开关决定，请拨开关而不是敲命令");
+      output.println("MODE 只读：模式由 GPIO4 拨动开关决定，请拨开关而不是敲命令");
     }
     return true;
   }
@@ -500,10 +558,8 @@ bool applyCommand(const String &raw) {
       after = cmd.substring(7);
       after.trim();
     }
-    if (!notifyActive) savedState = currentState;
-    notifyAfter  = after;
-    notifyActive = true;
-    notifyStartMs = millis();
+    if (after.length() && !statuslight::isStateCommand(after)) return false;
+    notification.begin(currentState, after, millis());
     return true;
   }
 
@@ -550,10 +606,7 @@ bool applyCommand(const String &raw) {
 
   const String nextState = planMode ? (canon + "+plan") : canon;
 
-  if (notifyActive && nextState != currentState) {
-    savedState = "";
-    savedClearedCount++;
-  }
+  if (notification.stateChanged(nextState, currentState)) savedClearedCount++;
 
   currentState = nextState;
 
@@ -564,6 +617,8 @@ bool applyCommand(const String &raw) {
   applyStateEffects(nextState);
   return true;
 }
+
+bool applyCommand(const String &raw) { return applyCommand(raw, Serial, true); }
 
 void selfTest() {
   Serial.println("ESP32_STATUS_LIGHT SELFTEST");
@@ -591,6 +646,24 @@ String apName() {
   return String(AP_PREFIX) + "-" + chipSuffix();
 }
 
+String configApPassword() {
+  Preferences prefs;
+  prefs.begin(NVS_NS, false);
+  String password = prefs.getString("apPass", "");
+#ifdef DSH_CONFIG_AP_PASSWORD
+  const String buildPassword = DSH_CONFIG_AP_PASSWORD;
+  if (password != buildPassword) { password = buildPassword; prefs.putString("apPass", password); }
+#endif
+  if (password.length() != 12) {
+    const char alphabet[] = "abcdefghijkmnpqrstuvwxyz23456789";
+    password = "";
+    for (unsigned i = 0; i < 12; ++i) password += alphabet[esp_random() % (sizeof(alphabet) - 1)];
+    prefs.putString("apPass", password);
+  }
+  prefs.end();
+  return password;
+}
+
 bool loadWifiCreds() {
   Preferences prefs;
   prefs.begin(NVS_NS, true);
@@ -606,6 +679,8 @@ void saveWifiCreds(const String &ssid, const String &pass) {
   prefs.putString("ssid", ssid);
   prefs.putString("pass", pass);
   prefs.end();
+  wifiSsid = ssid;
+  wifiPass = pass;
 }
 
 void clearWifiCreds() {
@@ -618,23 +693,23 @@ void clearWifiCreds() {
 }
 
 void applyPowerSettings() {
-  if (WiFi.getMode() != WIFI_OFF) {
-
-    const uint8_t dbm = configMode ? cfgConfigTxDbm : cfgTxPowerDbm;
-    WiFi.setTxPower((wifi_power_t)(dbm * 4));
-  }
-  if (cfgBodEnabled) {
-    esp_brownout_init();
+  if (WiFi.getMode() == WIFI_OFF) return;
+  const uint8_t dbm = configMode ? cfgConfigTxDbm : cfgTxPowerDbm;
+  if (!WiFi.setTxPower((wifi_power_t)(dbm * 4))) {
+    Serial.println("WIFI tx-power apply failed");
   } else {
-    esp_brownout_disable();
+    Serial.printf("WIFI tx=%udBm actual-quarter-dBm=%d\n", dbm, (int)WiFi.getTxPower());
   }
 }
 
 void loadPowerSettings() {
   Preferences prefs;
   prefs.begin(NVS_NS, true);
-  cfgTxPowerDbm = prefs.getUChar("txp", 20);
-  cfgBodEnabled = prefs.getUChar("bod", 1) != 0;
+  cfgTxPowerDbm = prefs.getUChar("txp", 13);
+  bool valid = false;
+  for (size_t i = 0; i < TX_POWER_CHOICE_COUNT; i++) if (TX_POWER_CHOICES_DBM[i] == cfgTxPowerDbm) valid = true;
+  if (!valid) cfgTxPowerDbm = 13;
+  // Ignore the old "bod" preference; framework brownout detection stays enabled.
   prefs.end();
 }
 
@@ -642,28 +717,30 @@ void savePowerSettings() {
   Preferences prefs;
   prefs.begin(NVS_NS, false);
   prefs.putUChar("txp", cfgTxPowerDbm);
-  prefs.putUChar("bod", cfgBodEnabled ? 1 : 0);
+  prefs.remove("bod");
   prefs.end();
 }
 
 void stopServers() {
+  if (netClient != nullptr) { netClient->stop(); delete netClient; netClient = nullptr; }
+  netAttached = false;
+  netBuf = "";
   netServer.end();
   netUdp.stop();
   webServer.stop();
 }
 
 void connectWifi() {
-  if (wifiSsid.length() == 0) return;
-  WiFi.mode(WIFI_STA);
-
+  if (wifiSsid.length() == 0 || usbMode) return;
+  recordBootStage("wifi-init");
+  if (WiFi.getMode() != WIFI_STA) WiFi.mode(WIFI_STA);
+  WiFi.setAutoReconnect(false);
   WiFi.setSleep(true);
-
   applyPowerSettings();
+  recordBootStage("wifi-begin");
   WiFi.begin(wifiSsid.c_str(), wifiPass.c_str());
-  connectPending = true;
-  lastAttemptMs = millis();
-  Serial.print("连接 WiFi：");
-  Serial.println(wifiSsid);
+  wifiRetry.attempted(millis());
+  Serial.println("WIFI connecting (credentials redacted)");
 }
 
 void enterConfigMode() {
@@ -681,36 +758,41 @@ void enterConfigMode() {
   netUp = false;
   netAttached = false;
   scanRunning = false;
-  connectPending = false;
+  wifiRetry.connected();
 
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(apName().c_str());
-  delay(200);
-
+  recordBootStage("config-ap");
+  WiFi.mode(WIFI_AP); // Scanning enables STA only when the user asks to scan.
   applyPowerSettings();
+  const String apPassword = configApPassword();
+  if (!WiFi.softAP(apName().c_str(), apPassword.c_str(), 1, 0, 1)) Serial.println("ERR config AP start failed");
+  // User-visible credential; redact this line when sharing a diagnostic capture.
+  Serial.printf("CONFIG AP=%s password=%s\n", apName().c_str(), apPassword.c_str());
   dnsServer.start(53, "*", WiFi.softAPIP());
 
+  if (!configRoutesRegistered) {
+  configRoutesRegistered = true;
   webServer.on("/", []() {
     lastConfigActivityMs = millis();
-    String page = FPSTR(CONFIG_PAGE);
-    page.replace("__NAME__", apName());
-    page.replace("__FW__", FW_VERSION);
-    page.replace("__SAVED__", wifiSsid.length() > 0 ? ("已保存: " + wifiSsid) : "无");
+    recordBootStage("config-http-send");
+#ifdef DSH_MINIMAL_CONFIG_PAGE
+    webServer.send_P(200, "text/html; charset=utf-8", MINIMAL_CONFIG_PAGE);
+#else
+    webServer.send_P(200, "text/html; charset=utf-8", CONFIG_PAGE);
+#endif
+    recordBootStage("config-http-done");
+  });
 
-    page.replace("__BOOTS__", String(bootDiag.boots));
-    page.replace("__RESET__", bootDiag.resetText[0] ? String(bootDiag.resetText) : String(resetReasonText()));
-
-    page.replace("__PREVRESET__", bootDiag.prevResetText[0] ? String(bootDiag.prevResetText) : String("(未记录)"));
-
-    page.replace("__NVSHIST__",
-                 String(nvsBootCount) + " 次" +
-                     (rtcLost ? " · 本次完全断电" : "") +
-                     " · 上次 " + (nvsLastReset.length() ? nvsLastReset : String("(无)")));
-    page.replace("__TXP__", String(cfgConfigTxDbm));
-    page.replace("__PREV__", bootDiag.lastReason[0]
-                                 ? (String(bootDiag.lastMode) + " " + String(bootDiag.lastUptimeS) + "s " + String(bootDiag.lastReason))
-                                 : String("(首次上电)"));
-    webServer.send(200, "text/html; charset=utf-8", page);
+  webServer.on("/info", []() {
+    lastConfigActivityMs = millis();
+    String json = "{\"name\":" + statuslight::jsonQuote(apName());
+    json += ",\"fw\":" + statuslight::jsonQuote(String(FW_VERSION));
+    json += ",\"reset\":" + statuslight::jsonQuote(String(resetReasonText()));
+    json += ",\"previousReset\":" + statuslight::jsonQuote(String(bootDiag.prevResetText));
+    json += ",\"previousStage\":" + statuslight::jsonQuote(previousBootStage);
+    json += ",\"saved\":" + statuslight::jsonQuote(wifiSsid.length() ? String("已保存: ") + wifiSsid : String("无"));
+    json += ",\"boots\":" + String(nvsBootCount);
+    json += ",\"heap\":" + String(ESP.getFreeHeap()) + "}";
+    webServer.send(200, "application/json; charset=utf-8", json);
   });
 
   webServer.on("/scan", []() {
@@ -725,32 +807,30 @@ void enterConfigMode() {
     webServer.send(202, "application/json", "{\"scanning\":true}");
   });
 
-  webServer.on("/save", []() {
+  webServer.on("/save", HTTP_POST, []() {
     lastConfigActivityMs = millis();
     const String ssid = webServer.arg("ssid");
     const String pass = webServer.arg("pass");
-    if (ssid.length() == 0) {
-      webServer.send(400, "text/plain; charset=utf-8", "缺少 WiFi 名称");
+    if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
+      webServer.send(400, "text/plain; charset=utf-8", "SSID须为1–32字节，密码最多64字节");
       return;
     }
     saveWifiCreds(ssid, pass);
     webServer.send(200, "text/html; charset=utf-8",
                    "<!doctype html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
-                   "<h3>已保存，正在重启…</h3><p>板子会连上 " + ssid + "，红灯停止闪烁即成功。</p></body>");
-    delay(600);
-    markIntentionalRestart("web /save");
-    ESP.restart();
+                   "<h3>已保存，正在连接…</h3><p>板子会连上 " + statuslight::htmlEscape(ssid) + "。连接成功后热点关闭，无需整机重启。</p></body>");
+    wifiConfigPending = true;
+    wifiConfigApplyMs = millis() + 200;
   });
 
-  webServer.on("/forget", []() {
+  webServer.on("/forget", HTTP_POST, []() {
     lastConfigActivityMs = millis();
     clearWifiCreds();
     webServer.send(200, "text/html; charset=utf-8",
                    "<!doctype html><meta charset='utf-8'><body style='font-family:sans-serif;padding:24px'>"
-                   "<h3>凭据已清除，正在重启…</h3></body>");
-    delay(600);
-    markIntentionalRestart("web /forget");
-    ESP.restart();
+                   "<h3>凭据已清除，请重新配网。</h3></body>");
+    wifiConfigPending = true;
+    wifiConfigApplyMs = millis() + 200;
   });
 
   webServer.on("/scanresult", []() {
@@ -765,15 +845,13 @@ void enterConfigMode() {
     }
     String json = "[";
     for (int i = 0; i < n; i++) {
-      if (i > 0) json += ",";
-      String s = WiFi.SSID(i);
-      s.replace("\\", "");
-      s.replace("\"", "");
-      if (s.length() == 0) continue;
+      const String ssid = WiFi.SSID(i);
+      if (ssid.length() == 0) continue;
       if (json.length() > 1) json += ",";
-      json += "\"" + s + "\"";
+      json += statuslight::jsonQuote(ssid);
     }
     json += "]";
+
     WiFi.scanDelete();
     webServer.send(200, "application/json", json);
   });
@@ -782,6 +860,7 @@ void enterConfigMode() {
     webServer.sendHeader("Location", String("http://") + WiFi.softAPIP().toString() + "/", true);
     webServer.send(302, "text/plain", "");
   });
+  }
 
   webServer.begin();
 
@@ -795,9 +874,10 @@ void exitConfigMode() {
   if (!configMode) return;
   stopServers();
   dnsServer.stop();
+  WiFi.softAPdisconnect(true);
   configMode = false;
   netBuf = "";
-  allLampsOff();
+  applyStateEffects(currentState);
 }
 
 void handleCommandLine(const String &line, const char *source) {
@@ -807,14 +887,14 @@ void handleCommandLine(const String &line, const char *source) {
 
   recordRx(cmd);
 
-  if (!hostHeard) {
+  if (!hostHeard && cmd != "hello") {
     hostHeard = true;
     announceReady("first-cmd");
   }
 
   if (configMode) {
 
-    const bool isDiag = cmd == "state?" || cmd == "state" || cmd == "wifi?" || cmd == "wifi" || cmd == "wifi clear";
+    const bool isDiag = cmd == "hello" || cmd == "ping" || cmd == "state?" || cmd == "state" || cmd == "wifi?" || cmd == "wifi" || cmd == "wifi clear" || cmd.startsWith("power");
     if (!isDiag) {
       Serial.print("ERR busy config-mode ");
       Serial.println(cmd);
@@ -829,7 +909,7 @@ void handleCommandLine(const String &line, const char *source) {
     Serial.print("ERR unknown ");
     Serial.println(cmd);
   }
-  lastCommandMs = millis();
+  if (statuslight::isStateCommand(cmd) || cmd == "hello" || cmd == "ping" || cmd.startsWith("tools ") || cmd.startsWith("notify") || cmd == "state?" || cmd == "wifi?") lastCommandMs = millis();
 }
 
 void replyNet(const String &text) {
@@ -857,10 +937,11 @@ bool drainNetLines() {
           replyNet(String("ERR busy config-mode ") + line);
           continue;
         }
-        const bool ok = applyCommand(line);
+        recordRx(line);
+        const bool ok = applyCommand(line, *netClient, false);
         Serial.print(ok ? "OK " : "ERR unknown ");
         Serial.println(line);
-        lastCommandMs = millis();
+        if (ok) lastCommandMs = millis();
         replyNet(String(ok ? "OK " : "ERR unknown ") + line);
       }
     } else if (netBuf.length() < 64) {
@@ -898,41 +979,14 @@ void serviceNetClient() {
   netBuf = "";
 
   netInboundMs = millis();
-  netProbeMs = netInboundMs;
-  netProbeFail = 0;
   netClient->setNoDelay(true);
   Serial.print("TCP 客户端接入：");
   Serial.println(netClient->remoteIP());
 }
 
 void handleNetLiveness(uint32_t nowMs) {
-  if (!netAttached || netClient == nullptr) return;
-
-  const int avail = netClient->available();
-  if (avail < 0) {
-    dropNetClient("对端异常");
-    return;
-  }
-  if (avail > 0) {
-
-    netInboundMs = nowMs;
-    netProbeFail = 0;
-    return;
-  }
-
-  if (nowMs - netInboundMs < NET_PROBE_IDLE_MS) return;
-  if (nowMs - netProbeMs < NET_PROBE_IDLE_MS) return;
-  netProbeMs = nowMs;
-
-  const size_t n = netClient->write("state?\n");
-  if (n == 0) {
-
-    netProbeFail++;
-    if (netProbeFail >= 2) {
-      dropNetClient("探针写不进去（半开连接）");
-    }
-  } else {
-    netProbeFail = 0;
+  if (netAttached && netClient != nullptr && (uint32_t)(nowMs - netInboundMs) >= NET_CLIENT_IDLE_MS) {
+    dropNetClient("application heartbeat timeout");
   }
 }
 
@@ -940,7 +994,7 @@ void serviceNetwork(uint32_t nowMs) {
   if (configMode) return;
   if (WiFi.status() != WL_CONNECTED) return;
   serviceNetClient();
-  handleNetLiveness(nowMs);
+  handleNetLiveness(millis());
 
   const int sz = netUdp.parsePacket();
   if (sz <= 0) return;
@@ -953,82 +1007,69 @@ void serviceNetwork(uint32_t nowMs) {
   String line = String(buf);
   line.trim();
   if (line.length() == 0) return;
-  const bool ok = applyCommand(line);
+  if (sz >= (int)sizeof(buf)) { netUdp.clear(); return; }
+  netUdp.beginPacket(from, fromPort);
+  recordRx(line);
+  const bool ok = applyCommand(line, netUdp, false);
   Serial.print(ok ? "OK " : "ERR unknown ");
   Serial.println(line);
-  lastCommandMs = millis();
-  netUdp.beginPacket(from, fromPort);
+  if (ok) lastCommandMs = millis();
   netUdp.print(ok ? "OK " : "ERR unknown ");
   netUdp.println(line);
   netUdp.endPacket();
 }
 
 void serviceWifiStatus(uint32_t nowMs) {
-
-  if (usbMode) return;
-
-  if (configMode) {
-    webServer.handleClient();
-    dnsServer.processNextRequest();
-
-    if (scanRunning) {
-      const int16_t n = WiFi.scanComplete();
-      if (n != WIFI_SCAN_RUNNING || nowMs - scanStartedMs > 20000) {
-        scanRunning = false;
-      }
-    }
-
-    if (nowMs - lastConfigActivityMs > CONFIG_SESSION_MS) {
-      Serial.println("配网模式空闲超时，退出并重试已存网络…");
-      delay(200);
-      markIntentionalRestart("config-mode idle timeout");
-      ESP.restart();
+  nowMs = millis();
+  if (wifiConfigPending && (int32_t)(nowMs - wifiConfigApplyMs) >= 0) {
+    wifiConfigPending = false;
+    exitConfigMode();
+    stopServers();
+    netUp = false;
+    wifiRetry.connected();
+    if (!usbMode) {
+      if (wifiSsid.length()) connectWifi();
+      else enterConfigMode();
     }
     return;
   }
-
+  if (usbMode) return;
+  if (lastWifiDisconnectReason != reportedWifiDisconnectReason) {
+    reportedWifiDisconnectReason = lastWifiDisconnectReason;
+    Serial.printf("WIFI disconnect reason=%u heap=%lu\n", reportedWifiDisconnectReason, (unsigned long)ESP.getFreeHeap());
+  }
+  if (configMode) {
+    webServer.handleClient();
+    dnsServer.processNextRequest();
+    // HTTP handlers may record a newer timestamp than loop() supplied. Sample
+    // again before unsigned subtraction, otherwise a 1 ms skew looks like 49 days.
+    nowMs = millis();
+    if (scanRunning && (WiFi.scanComplete() != WIFI_SCAN_RUNNING || (uint32_t)(nowMs - scanStartedMs) > 20000)) scanRunning = false;
+    if ((uint32_t)(nowMs - lastConfigActivityMs) > CONFIG_SESSION_MS) {
+      lastConfigActivityMs = nowMs;
+      if (wifiSsid.length()) { exitConfigMode(); connectWifi(); }
+    }
+    return;
+  }
   if (WiFi.status() == WL_CONNECTED) {
+    wifiRetry.connected();
     if (!netUp) {
       netUp = true;
-      Serial.print("WiFi 已连接，IP：");
+      recordBootStage("wifi-connected");
+      Serial.print("WIFI connected IP=");
       Serial.println(WiFi.localIP());
-      Serial.print("监听 TCP ");
-      Serial.println(NET_PORT);
       netServer.begin();
       netUdp.begin(NET_PORT);
     }
     return;
   }
-
-  if (netUp || connectPending) {
-    netUp = false;
-    netAttached = false;
-    if (netClient != nullptr) {
-      netClient->stop();
-      delete netClient;
-      netClient = nullptr;
-    }
-    connectPending = false;
-    netServer.end();
-    netUdp.stop();
-    lastAttemptMs = nowMs;
-    Serial.println("WiFi 断开，稍后重连…");
+  if (netUp) { netUp = false; stopServers(); }
+  if (!wifiSsid.length()) { enterConfigMode(); return; }
+  switch (wifiRetry.next(nowMs, WIFI_RETRY_MS, CONFIG_TIMEOUT_MS)) {
+    case statuslight::RetryAction::Connect: connectWifi(); break;
+    case statuslight::RetryAction::Configure: enterConfigMode(); break;
+    case statuslight::RetryAction::Wait: break;
   }
-
-  if (wifiSsid.length() == 0) {
-    enterConfigMode();
-    return;
-  }
-
-  if (nowMs - lastAttemptMs >= CONFIG_TIMEOUT_MS) {
-    Serial.println("连不上已存 WiFi，进入配网模式");
-    enterConfigMode();
-    return;
-  }
-
-  if (nowMs - lastAttemptMs < WIFI_RETRY_MS) return;
-  lastAttemptMs = nowMs;
-  connectWifi();
 }
 
 void reportBootMode() {
@@ -1041,14 +1082,13 @@ void reportBootMode() {
   bootDiag.resetText[sizeof(bootDiag.resetText) - 1] = '\0';
 }
 
-void markIntentionalRestart(const char *why) {
-  if (bootDiag.magic != BOOT_DIAG_MAGIC) return;
-  strncpy(bootDiag.lastReason, why, sizeof(bootDiag.lastReason) - 1);
-  bootDiag.lastReason[sizeof(bootDiag.lastReason) - 1] = '\0';
-  const char *m = usbMode ? "usb" : "wifi";
-  strncpy(bootDiag.lastMode, m, sizeof(bootDiag.lastMode) - 1);
-  bootDiag.lastMode[sizeof(bootDiag.lastMode) - 1] = '\0';
-  bootDiag.lastUptimeS = millis() / 1000;
+void recordBootStage(const char *stage) {
+  if (bootDiag.magic == BOOT_DIAG_MAGIC) {
+    strncpy(bootDiag.lastStage, stage, sizeof(bootDiag.lastStage) - 1);
+    bootDiag.lastStage[sizeof(bootDiag.lastStage) - 1] = '\0';
+    bootDiag.lastUptimeS = millis() / 1000;
+  }
+  Serial.printf("BOOT stage=%s heap=%lu\n", stage, (unsigned long)ESP.getFreeHeap());
 }
 
 const char *resetReasonName() {
@@ -1091,8 +1131,14 @@ void reportResetReason() {
     bootDiag.lastUptimeS = 0;
     bootDiag.resetText[0] = '\0';
     bootDiag.prevResetText[0] = '\0';
+    bootDiag.lastStage[0] = '\0';
   }
+  previousBootStage = bootDiag.lastStage[0] ? bootDiag.lastStage : "unknown";
   bootDiag.boots++;
+  Serial.printf("BOOT previous-stage=%s previous-uptime=%lus core=%s brownout=framework-default\n",
+                bootDiag.lastStage[0] ? bootDiag.lastStage : "unknown",
+                (unsigned long)bootDiag.lastUptimeS, ESP_ARDUINO_VERSION_STR);
+  bootDiag.lastReason[0] = '\0';
 
   strncpy(bootDiag.prevResetText, bootDiag.resetText, sizeof(bootDiag.prevResetText) - 1);
   bootDiag.prevResetText[sizeof(bootDiag.prevResetText) - 1] = '\0';
@@ -1110,7 +1156,7 @@ void reportResetReason() {
     Serial.println("BOOT prev: (首次上电或上次没记录)");
   }
   if (rtcLost) {
-    Serial.println("BOOT rtcLost=1 → RTC 诊断块无效 = 芯片经历过**完全断电**（不是普通复位）");
+    Serial.println("BOOT rtcLost=1: RTC diagnostic block invalid; power loss is one possible cause");
   }
   Serial.printf("BOOT NVS 历史（不受断电影响）: boots=%lu last=%s prev=%s\n",
                 (unsigned long)nvsBootCount,
@@ -1139,34 +1185,21 @@ void recordResetHistory() {
   prefs.end();
 }
 
-void announceReady(const char *why) {
+void announceReady(const char *why, Print &output) {
   lastReadyMs = millis();
   readyResends++;
-
-  Serial.printf(
-      "ESP32_STATUS_LIGHT READY fw=%s via=%s reset=%s prev=%s boots=%lu rtcLost=%d nvsN=%lu nvsLast=%s rx=%s\n",
-      FW_VERSION, why,
-      bootDiag.resetText[0] ? bootDiag.resetText : resetReasonText(),
-      bootDiag.prevResetText[0] ? bootDiag.prevResetText : "(未记录)",
-      (unsigned long)bootDiag.boots, rtcLost ? 1 : 0,
-      (unsigned long)nvsBootCount, nvsLastReset.length() ? nvsLastReset.c_str() : "(无)",
-      lastRxCmd());
+  output.printf("ESP32_STATUS_LIGHT READY fw=%s via=%s mode=%s config=%d reset=%s prev=%s boots=%lu rtcLost=%d stage=%s nvsN=%lu\n",
+      FW_VERSION, why, usbMode ? "usb" : "wifi", configMode ? 1 : 0,
+      resetReasonText(), bootDiag.prevResetText[0] ? bootDiag.prevResetText : "unknown",
+      (unsigned long)bootDiag.boots, rtcLost ? 1 : 0, bootDiag.lastStage, (unsigned long)nvsBootCount);
 }
+void announceReady(const char *why) { announceReady(why, Serial); }
 
 void serviceReadyAnnounce(uint32_t nowMs) {
   if (hostHeard) return;
   if (readyResends >= READY_RESEND_MAX) return;
   if (nowMs - lastReadyMs < READY_RESEND_MS) return;
   announceReady("idle");
-}
-
-bool waitForSerialInput(uint32_t ms) {
-  const uint32_t start = millis();
-  while (millis() - start < ms) {
-    if (Serial.available() > 0) return true;
-    delay(10);
-  }
-  return false;
 }
 
 bool readModeSwitchWifiPreferred() {
@@ -1196,9 +1229,10 @@ void setup() {
 
   pinMode(PIN_CONFIG, INPUT_PULLUP);
 
-  ledcAttach(PIN_YELLOW, PWM_FREQ, PWM_BITS);
-  ledcAttach(PIN_GREEN,  PWM_FREQ, PWM_BITS);
-  ledcAttach(PIN_RED,    PWM_FREQ, PWM_BITS);
+  const bool yellowPwm = ledcAttach(PIN_YELLOW, PWM_FREQ, PWM_BITS);
+  const bool greenPwm = ledcAttach(PIN_GREEN, PWM_FREQ, PWM_BITS);
+  const bool redPwm = ledcAttach(PIN_RED, PWM_FREQ, PWM_BITS);
+  if (!yellowPwm || !greenPwm || !redPwm) Serial.println("ERR PWM initialization failed");
 
   allLampsOff();
   writeLed(PIN_RED,    0);
@@ -1224,37 +1258,19 @@ void setup() {
   reportBootMode();
 
   const bool haveCreds = loadWifiCreds();
-
   loadPowerSettings();
-  applyPowerSettings();
-
+  WiFi.onEvent([](arduino_event_id_t event, arduino_event_info_t info) {
+    if (event == ARDUINO_EVENT_WIFI_STA_DISCONNECTED) lastWifiDisconnectReason = info.wifi_sta_disconnected.reason;
+  });
   if (usbMode) {
-
     WiFi.mode(WIFI_OFF);
-    Serial.println("有线模式：走串口，WiFi 已关闭");
+    recordBootStage("usb-running");
   } else if (haveCreds) {
     connectWifi();
-    const uint32_t t0 = millis();
-
-    while (WiFi.status() != WL_CONNECTED && millis() - t0 < SETUP_WIFI_WAIT_MS) {
-      if (waitForSerialInput(250)) break;
-      Serial.print(".");
-    }
-    Serial.println();
-    if (WiFi.status() == WL_CONNECTED) {
-      netUp = true;
-      Serial.print("WiFi 已连接，IP：");
-      Serial.println(WiFi.localIP());
-      netServer.begin();
-      netUdp.begin(NET_PORT);
-    } else {
-      Serial.println("连不上，进入配网模式");
-      enterConfigMode();
-    }
   } else {
-    Serial.println("未保存 WiFi 凭据");
     enterConfigMode();
   }
+
 
   announceReady("boot");
 
@@ -1275,7 +1291,6 @@ bool trySerialWifiConfig(const String &line) {
   String ssid = arg.substring(0, sp);
   String pass = arg.substring(sp + 1);
   ssid.trim();
-  pass.trim();
 
   if (ssid.length() == 0 || ssid.length() > 32 || pass.length() > 64) {
     Serial.println("ERR wifi 参数不合法（SSID 1-32 字节，密码 ≤64 字节）");
@@ -1285,16 +1300,16 @@ bool trySerialWifiConfig(const String &line) {
   saveWifiCreds(ssid, pass);
   Serial.print("OK wifi saved ");
   Serial.println(ssid);
-  Serial.println("重启后连接…");
-  delay(400);
-  markIntentionalRestart("serial wifi config");
-  ESP.restart();
+  wifiConfigPending = true;
+  wifiConfigApplyMs = millis() + 100;
+  Serial.println(usbMode ? "Credentials stored; select WiFi mode to connect" : "Connecting without restarting");
   return true;
 }
 
 void loop() {
   uint32_t now = millis();
   loopCount++;
+  bootDiag.lastUptimeS = now / 1000;
 
   static uint32_t prevLoopMs = 0;
   if (prevLoopMs == 0) {
@@ -1307,26 +1322,31 @@ void loop() {
   }
 
   static String buffer = "";
+  static bool bufferOverflow = false;
   while (Serial.available() > 0) {
     char c = (char)Serial.read();
     if (c == '\n' || c == '\r') {
+      if (bufferOverflow) { buffer = ""; bufferOverflow = false; Serial.println("ERR command too long"); continue; }
       if (buffer.length() > 0) {
         String line = buffer;
         buffer = "";
-        line.trim();
         if (line.length() > 0) {
           if (!trySerialWifiConfig(line)) handleCommandLine(line, "serial");
         }
       }
-    } else if (buffer.length() < 64) {
+    } else if (buffer.length() < 128) {
       buffer += c;
+    } else {
+      bufferOverflow = true;
     }
   }
 
+  now = millis();
   serviceNetwork(now);
 
   serviceWifiStatus(now);
 
+  now = millis();
   checkModeSwitch(now);
 
   serviceReadyAnnounce(now);
@@ -1341,9 +1361,8 @@ void loop() {
     const uint32_t totalMs = (uint32_t)(NOTIFY_ON_MS + NOTIFY_OFF_MS) * NOTIFY_BLINKS;
     const uint32_t nowNotify = millis();
     if ((uint32_t)(nowNotify - notifyStartMs) >= totalMs) {
-      notifyActive = false;
-      String target = notifyAfter;
-      if (target.length() == 0) target = savedState;
+      String target;
+      notification.complete(nowNotify, totalMs, target);
       if (target.length() > 0) {
         applyCommand(target);
         Serial.print("OK notify -> ");
@@ -1378,18 +1397,25 @@ void loop() {
 }
 
 void checkModeSwitch(uint32_t nowMs) {
-
-  static uint32_t lastPollMs = 0;
-  if (nowMs - lastPollMs < SWITCH_POLL_MS) return;
-  lastPollMs = nowMs;
-
-  const bool wantWifi = readModeSwitchWifiPreferred();
-  if (wantWifi == switchWifiPreferred) return;
-
-  switchWifiPreferred = wantWifi;
-  Serial.println();
-  Serial.printf("模式开关拨动 → 切到%s模式，重启…\n", wantWifi ? "无线(WiFi)" : "有线(串口)");
-  delay(200);
-  markIntentionalRestart(wantWifi ? "switch->wireless" : "switch->wired");
-  ESP.restart();
+  static bool candidate = switchWifiPreferred;
+  static uint32_t changedAt = 0;
+  const bool raw = digitalRead(PIN_CONFIG) == LOW;
+  if (raw != candidate) { candidate = raw; changedAt = nowMs; return; }
+  if (candidate == switchWifiPreferred || (uint32_t)(nowMs - changedAt) < SWITCH_DEBOUNCE_MS) return;
+  switchWifiPreferred = candidate;
+  exitConfigMode();
+  stopServers();
+  netUp = false;
+  wifiRetry.connected();
+  usbMode = !candidate;
+  reportBootMode();
+  if (usbMode) {
+    WiFi.mode(WIFI_OFF);
+    recordBootStage("usb-running");
+  } else if (wifiSsid.length()) {
+    connectWifi();
+  } else {
+    enterConfigMode();
+  }
+  announceReady("mode-change");
 }

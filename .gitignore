@@ -2,6 +2,7 @@ node_modules/
 .tools/
 .build/
 .pio/
+v2.0/firmware/esp32c3_dsh_status_light/build/
 dist/
 *.bin
 *.elf

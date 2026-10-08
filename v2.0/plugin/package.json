@@ -1,8 +1,11 @@
 {
   "name": "dsh-led-bridge",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
