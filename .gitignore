@@ -13,3 +13,13 @@ __pycache__/
 .env.*
 !.env.example
 *.local.yml
+ap-password.txt
+dsh_build_config.h
+downloads/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.pyc
+*.tmp
+*.bak
