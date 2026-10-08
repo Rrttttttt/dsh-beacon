@@ -1,7 +1,7 @@
 #include <cassert>
 #include <iostream>
 #include <string>
-#include "../v2.0/firmware/esp32c3_dsh_status_light/status_logic.h"
+#include "../firmware/esp32c3_dsh_status_light/status_logic.h"
 
 int main() {
   using namespace statuslight;

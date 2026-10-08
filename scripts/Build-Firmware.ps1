@@ -16,7 +16,7 @@ if (-not $BuildRoot) { $BuildRoot = Join-Path ([IO.Path]::GetTempPath()) ('dsh-s
 $BuildRoot = [IO.Path]::GetFullPath($BuildRoot)
 if ($BuildRoot -match '[^\x00-\x7F]') { throw 'ESP32 Windows linker requires an ASCII build path. Set -BuildRoot to an ASCII directory.' }
 New-Item -ItemType Directory -Path $BuildRoot -Force | Out-Null
-$taskSketch = Join-Path $taskRoot 'v2.0\firmware\esp32c3_dsh_status_light'
+$taskSketch = Join-Path $taskRoot 'firmware\esp32c3_dsh_status_light'
 $taskOutput = Join-Path $taskRoot $(if ($MinimalConfig) { '.build\firmware-minimal' } else { '.build\firmware' })
 New-Item -ItemType Directory -Path $taskOutput -Force | Out-Null
 # Keep the secret out of source control and console output. Both variants reuse it.

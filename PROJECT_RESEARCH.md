@@ -8,7 +8,7 @@
 
 这是一个将 DeepSeek Harness 的运行事件显示为红、黄、绿灯效的桌面外围设备项目。电脑端插件负责解释事件；ESP32-C3 负责接收命令、驱动三路 LED 和 Wi-Fi 配网。根据现有源码，主要功能已经实现，但尚不能认定为经过完整验证的稳定版本：事件语义、状态同步、配网扫描和断网恢复存在明确问题，且缺少构建与接线资料。
 
-硬件端没有调用 DeepSeek 模型的代码，没有屏幕驱动；“显示器”在当前实现中具体指三色状态灯。固件内有 TCP/UDP 控制入口，HTTP 只用于配网，插件实际使用串口和 TCP。依据：[插件入口](./v2.0/plugin/lib/index.js)第901–933行；[固件](./v2.0/firmware/esp32c3_dsh_status_light/esp32c3_dsh_status_light.ino)第9–18、208–211、939–964行。
+硬件端没有调用 DeepSeek 模型的代码，没有屏幕驱动；“显示器”在当前实现中具体指三色状态灯。固件内有 TCP/UDP 控制入口，HTTP 只用于配网，插件实际使用串口和 TCP。依据：[插件入口](https://github.com/Rrttttttt/dsh-beacon/blob/ce246c3e4f2eb8906a9ffacd51e2d81ab60a4ca6/v2.0/plugin/lib/index.js)第901–933行；[固件](https://github.com/Rrttttttt/dsh-beacon/blob/ce246c3e4f2eb8906a9ffacd51e2d81ab60a4ca6/v2.0/firmware/esp32c3_dsh_status_light/esp32c3_dsh_status_light.ino)第9–18、208–211、939–964行。
 
 ## 2. 项目构成
 

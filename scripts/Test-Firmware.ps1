@@ -8,7 +8,7 @@ if (-not $Compiler) {
   if ($taskZig) { $Compiler = $taskZig.FullName; $Zig = $true }
   else { $Compiler = (Get-Command g++ -ErrorAction Stop).Source }
 }
-if (-not $FirmwareSource) { $FirmwareSource = Join-Path $taskRoot 'v2.0\firmware\esp32c3_dsh_status_light\esp32c3_dsh_status_light.ino' }
+if (-not $FirmwareSource) { $FirmwareSource = Join-Path $taskRoot 'firmware\esp32c3_dsh_status_light\esp32c3_dsh_status_light.ino' }
 $taskSource = Get-Content -LiteralPath $FirmwareSource -Raw
 $taskStart = $taskSource.IndexOf('void serviceWifiStatus(uint32_t nowMs) {')
 $taskEnd = $taskSource.IndexOf('void reportBootMode()', $taskStart)

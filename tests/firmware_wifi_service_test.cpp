@@ -3,7 +3,7 @@
 #include <functional>
 #include <iostream>
 #include <string>
-#include "../v2.0/firmware/esp32c3_dsh_status_light/status_logic.h"
+#include "../firmware/esp32c3_dsh_status_light/status_logic.h"
 
 // Execute the actual serviceWifiStatus() body extracted from the sketch, with
 // deterministic HTTP callbacks and a fake clock. No ESP32 hardware is simulated.

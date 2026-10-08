@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import vm from 'node:vm'
 import test from 'node:test'
 
-const source = readFileSync(new URL('../../firmware/esp32c3_dsh_status_light/esp32c3_dsh_status_light.ino', import.meta.url), 'utf8')
+const source = readFileSync(new URL('../firmware/esp32c3_dsh_status_light/esp32c3_dsh_status_light.ino', import.meta.url), 'utf8')
 const page = source.match(/const char CONFIG_PAGE\[\].*?R"HTML\(([\s\S]*?)\)HTML";/)[1]
 const script = page.match(/<script>([\s\S]*?)<\/script>/)[1]
 function browser(fetch) {
