@@ -48,6 +48,10 @@ npm ci
 
 ### 2. 编译和烧录
 
+预编译固件可从 [GitHub Releases](https://github.com/Rrttttttt/dsh-beacon/releases) 下载。普通版提供 Wi-Fi 扫描和可点击的网络列表；最小版仅提供手动输入。每个版本都有完整镜像和应用镜像，并附烧录说明及 SHA-256 校验值。
+
+**Release 固件不内置固定配网密码。** 首次进入配网时，设备生成并保存随机密码。用 USB 串口监视器（115200 波特率）读取 `CONFIG AP=... password=...`；若错过该行，可将开关切到 USB 档再切回 Wi-Fi 档。应用更新保留现有 NVS 中的密码。关闭串口监视器后再启动插件，分享日志前隐藏密码。
+
 已验证环境为 **Arduino CLI 1.3.1 / Arduino-ESP32 3.3.11**。默认构建参数：
 
 | 参数 | 值 |
@@ -69,6 +73,8 @@ arduino-cli core install esp32:esp32@3.3.11 --additional-urls https://espressif.
 - `.build/firmware/`：普通版固件。
 - `.build/ap-password.txt`：本次构建的随机配网热点密码。后续构建复用此文件，普通版和最小版使用同一密码。
 
+公开发布时使用 `./scripts/Build-Firmware.ps1 -Release`；最小版再加 `-MinimalConfig`。输出分别为 `.build/firmware-release/` 和 `.build/firmware-minimal-release/`，不读取或嵌入本地密码，采用设备生成密码的方式。
+
 烧录时按镜像类型选择地址：
 
 | 文件 | 地址 | 用途 |
@@ -87,7 +93,7 @@ arduino-cli core install esp32:esp32@3.3.11 --additional-urls https://espressif.
 **Wi-Fi：**
 
 1. 闭合模式开关。没有凭据或连接失败时，红灯慢闪，设备开启 `DSH-Beacon-XXXX`。
-2. 手机连接该热点。构建脚本生成的固件使用 `.build/ap-password.txt` 中的密码。
+2. 手机连接该热点。默认本地构建使用 `.build/ap-password.txt` 中的密码；Release 或 IDE 直接编译的固件从串口读取密码，方法见上文。
 3. 浏览器打开 `http://192.168.4.1/`。若手机没有自动弹出配网页，手动打开此地址。
 4. 点击“扫描附近 Wi-Fi”。结果直接显示为网络名称按钮，同名接入点合并；点击即可填入 SSID，也可手动填写。
 5. 填写目标 **2.4 GHz** 网络的密码，点击保存。设备关闭配网热点并连接目标网络，无需整机重启。

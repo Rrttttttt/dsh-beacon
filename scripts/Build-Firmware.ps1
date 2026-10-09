@@ -3,7 +3,8 @@ param(
   [string]$CoreData = '',
   [string]$BuildRoot = '',
   [ValidateSet('80','160')][string]$CpuMHz = '80',
-  [switch]$MinimalConfig
+  [switch]$MinimalConfig,
+  [switch]$Release
 )
 $ErrorActionPreference = 'Stop'
 $taskRoot = Split-Path -Parent $PSScriptRoot
@@ -17,36 +18,41 @@ $BuildRoot = [IO.Path]::GetFullPath($BuildRoot)
 if ($BuildRoot -match '[^\x00-\x7F]') { throw 'ESP32 Windows linker requires an ASCII build path. Set -BuildRoot to an ASCII directory.' }
 New-Item -ItemType Directory -Path $BuildRoot -Force | Out-Null
 $taskSketch = Join-Path $taskRoot 'firmware\esp32c3_dsh_status_light'
-$taskOutput = Join-Path $taskRoot $(if ($MinimalConfig) { '.build\firmware-minimal' } else { '.build\firmware' })
+$taskOutputName = if ($MinimalConfig) { 'firmware-minimal' } else { 'firmware' }
+if ($Release) { $taskOutputName += '-release' }
+$taskOutput = Join-Path $taskRoot ('.build\' + $taskOutputName)
 New-Item -ItemType Directory -Path $taskOutput -Force | Out-Null
-# Keep the secret out of source control and console output. Both variants reuse it.
+# Local builds reuse a private password; release builds leave it to the device.
 $taskPasswordPath = Join-Path $taskRoot '.build\ap-password.txt'
-if (Test-Path -LiteralPath $taskPasswordPath) {
-  $taskPassword = (Get-Content -LiteralPath $taskPasswordPath -Raw).Trim()
-  if ($taskPassword -notmatch '^[A-Za-z0-9]{12}$') { throw 'Invalid local AP password file.' }
-} else {
-  $taskAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
-  $taskBytes = New-Object byte[] 12
-  $taskRng = [Security.Cryptography.RandomNumberGenerator]::Create()
-  try {
-    $taskPassword = ''
-    while ($taskPassword.Length -lt 12) {
-      $taskRng.GetBytes($taskBytes)
-      foreach ($taskByte in $taskBytes) {
-        # Reject the incomplete last bucket to avoid modulo bias.
-        if ($taskByte -lt (256 - (256 % $taskAlphabet.Length))) {
-          $taskPassword += $taskAlphabet[$taskByte % $taskAlphabet.Length]
-          if ($taskPassword.Length -eq 12) { break }
+if (-not $Release) {
+  if (Test-Path -LiteralPath $taskPasswordPath) {
+    $taskPassword = (Get-Content -LiteralPath $taskPasswordPath -Raw).Trim()
+    if ($taskPassword -notmatch '^[A-Za-z0-9]{12}$') { throw 'Invalid local AP password file.' }
+  } else {
+    $taskAlphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz23456789'
+    $taskBytes = New-Object byte[] 12
+    $taskRng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try {
+      $taskPassword = ''
+      while ($taskPassword.Length -lt 12) {
+        $taskRng.GetBytes($taskBytes)
+        foreach ($taskByte in $taskBytes) {
+          # Reject the incomplete last bucket to avoid modulo bias.
+          if ($taskByte -lt (256 - (256 % $taskAlphabet.Length))) {
+            $taskPassword += $taskAlphabet[$taskByte % $taskAlphabet.Length]
+            if ($taskPassword.Length -eq 12) { break }
+          }
         }
       }
-    }
-  } finally { $taskRng.Dispose() }
-  [IO.File]::WriteAllText($taskPasswordPath, $taskPassword + [Environment]::NewLine)
+    } finally { $taskRng.Dispose() }
+    [IO.File]::WriteAllText($taskPasswordPath, $taskPassword + [Environment]::NewLine)
+  }
 }
 $taskConfigRoot = $BuildRoot + '-config'
 New-Item -ItemType Directory -Path $taskConfigRoot -Force | Out-Null
 $taskHeader = Join-Path $taskConfigRoot 'dsh_build_config.h'
-$taskDefines = '#define DSH_CONFIG_AP_PASSWORD "' + $taskPassword + '"' + "`n"
+$taskDefines = "// Generated build options. Release firmware uses a device-generated AP password.`n"
+if (-not $Release) { $taskDefines += '#define DSH_CONFIG_AP_PASSWORD "' + $taskPassword + '"' + "`n" }
 if ($MinimalConfig) { $taskDefines += "#define DSH_MINIMAL_CONFIG_PAGE 1`n" }
 [IO.File]::WriteAllText($taskHeader, $taskDefines)
 $taskArgs = @()
@@ -65,4 +71,5 @@ $taskArgs += @('compile','--fqbn',$taskFqbn,'--build-path',$BuildRoot,'--output-
 & $CliPath @taskArgs
 if ($LASTEXITCODE -ne 0) { throw "Arduino compile failed: $LASTEXITCODE" }
 Write-Output "Firmware output: $taskOutput"
-Write-Output "Config AP password file: $taskPasswordPath"
+if ($Release) { Write-Output 'Config AP password: generated and stored on the device; read CONFIG AP=... password=... over serial.' }
+else { Write-Output "Config AP password file: $taskPasswordPath" }
